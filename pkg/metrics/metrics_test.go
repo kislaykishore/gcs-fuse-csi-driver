@@ -54,7 +54,7 @@ func TestNewMetricsManager(t *testing.T) {
 			t.Logf("test case: %s", tc.name)
 
 			clientset := clientset.NewFakeClientset()
-			manager := NewMetricsManager(tc.endpoint, tc.socketDir, tc.maxCollectors, clientset).(*manager)
+			manager := NewMetricsManager(tc.endpoint, tc.socketDir, tc.maxCollectors, clientset, false).(*manager)
 
 			if manager.metricsEndpoint != tc.endpoint {
 				t.Errorf("NewMetricsManager did not set metricsEndpoint correctly. Got %q, want %q", manager.metricsEndpoint, tc.endpoint)
