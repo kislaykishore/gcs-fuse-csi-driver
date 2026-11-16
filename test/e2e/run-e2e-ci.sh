@@ -30,7 +30,7 @@ readonly use_gke_managed_driver="${USE_GKE_MANAGED_DRIVER:-true}"
 ginkgo_focus="${TEST_FOCUS:-}"
 raw_skip="${TEST_SKIP:-}"
 readonly ginkgo_skip="${raw_skip//\"/}"
-readonly ginkgo_timeout="${E2E_TEST_GINKGO_TIMEOUT:-4h}"
+readonly ginkgo_timeout="${E2E_TEST_GINKGO_TIMEOUT:-}"
 readonly ginkgo_procs="${E2E_TEST_GINKGO_PROCS:-40}"
 readonly boskos_resource_type="${GCE_PD_BOSKOS_RESOURCE_TYPE:-gke-internal-project}"
 readonly manage_cluster_lifecycle="${E2E_TEST_MANAGE_CLUSTER_LIFECYCLE:-true}"
@@ -39,8 +39,8 @@ readonly gke_cluster_version=${GKE_CLUSTER_VERSION:-latest}
 readonly gke_release_channel=${GKE_RELEASE_CHANNEL:-rapid}
 readonly gke_node_version=${GKE_NODE_VERSION:-}
 readonly node_image_type=${IMAGE_TYPE:-cos_containerd}
-readonly node_machine_type=${MACHINE_TYPE:-n2-standard-8}
-readonly number_nodes=${NUMBER_NODES:-9}
+readonly node_machine_type=${MACHINE_TYPE:-}
+readonly number_nodes=${NUMBER_NODES:-}
 readonly use_capacity_advisor=${USE_CAPACITY_ADVISOR:-true}
 readonly gcsfuse_client_protocol=${GCSFUSE_CLIENT_PROTOCOL:-http1}
 readonly build_gcsfuse_from_source=${BUILD_GCSFUSE_FROM_SOURCE:-false}
@@ -67,6 +67,14 @@ fi
 readonly overlay
 readonly ginkgo_focus
 readonly gcsfuse_pr_number=${GCSFUSE_PR_NUMBER:-}
+csi_driver_memory_limit_arg=""
+if [ "${CSI_DRIVER_MEMORY_LIMIT+set}" = "set" ]; then
+  csi_driver_memory_limit_arg="--csi-driver-memory-limit=\"${CSI_DRIVER_MEMORY_LIMIT}\""
+fi
+readonly csi_driver_memory_limit_arg
+readonly soak_duration=${SOAK_DURATION:-}
+readonly soak_scrape_interval=${SOAK_SCRAPE_INTERVAL:-}
+readonly soak_pod_count=${SOAK_POD_COUNT:-}
 
 # Install golang
 version=1.22.7
@@ -100,16 +108,16 @@ base_cmd="${PKGDIR}/bin/e2e-test-ci \
             --use-gke-managed-driver=${use_gke_managed_driver} \
             --ginkgo-focus=\"${ginkgo_focus}\" \
             --ginkgo-skip=\"${ginkgo_skip}\" \
-            --ginkgo-timeout=${ginkgo_timeout} \
+            ${ginkgo_timeout:+--ginkgo-timeout=${ginkgo_timeout}} \
             --ginkgo-procs=${ginkgo_procs} \
             --boskos-resource-type=${boskos_resource_type} \
             --gke-cluster-version=${gke_cluster_version} \
             --gke-release-channel=${gke_release_channel} \
             --gke-node-version=${gke_node_version} \
             --node-image-type=${node_image_type} \
-            --node-machine-type=${node_machine_type} \
+            ${node_machine_type:+--node-machine-type=${node_machine_type}} \
             --gcsfuse-client-protocol=${gcsfuse_client_protocol} \
-            --number-nodes=${number_nodes} \
+            ${number_nodes:+--number-nodes=${number_nodes}} \
             --gcsfuse-enable-zb=${enable_zb} \
             --enable-sidecar-bucket-access-check=${enable_sidecar_bucket_access_check} \
             --enable-gcsfuse-profiles=${enable_gcsfuse_profiles} \
@@ -119,5 +127,9 @@ base_cmd="${PKGDIR}/bin/e2e-test-ci \
             --gke-gcloud-args='${gke_gcloud_args}'\
             --deploy-overlay-name=${overlay} \
             --use-capacity-advisor=${use_capacity_advisor} \
-            ${gcsfuse_pr_number:+--gcsfuse-pr-number=${gcsfuse_pr_number}}"
+            ${gcsfuse_pr_number:+--gcsfuse-pr-number=${gcsfuse_pr_number}} \
+            ${csi_driver_memory_limit_arg} \
+            ${soak_duration:+--soak-duration=${soak_duration}} \
+            ${soak_scrape_interval:+--soak-scrape-interval=${soak_scrape_interval}} \
+            ${soak_pod_count:+--soak-pod-count=${soak_pod_count}}"
 eval "$base_cmd"

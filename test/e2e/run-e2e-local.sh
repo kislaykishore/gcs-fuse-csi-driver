@@ -37,14 +37,15 @@ readonly build_gcsfuse_from_source="${BUILD_GCSFUSE_FROM_SOURCE:-false}"
 readonly manage_cluster_lifecycle="${E2E_TEST_MANAGE_CLUSTER_LIFECYCLE:-false}"
 readonly use_boskos="${E2E_TEST_USE_BOSKOS:-false}"
 readonly project_id="${E2E_TEST_PROJECT_ID:-}"
-readonly num_nodes="${E2E_TEST_NUM_NODES:-${NUMBER_NODES:-9}}"
+readonly num_nodes="${E2E_TEST_NUM_NODES:-${NUMBER_NODES:-}}"
+readonly node_machine_type="${E2E_TEST_MACHINE_TYPE:-${MACHINE_TYPE:-}}"
 readonly boskos_resource_type="${E2E_TEST_BOSKOS_RESOURCE_TYPE:-${GCE_PD_BOSKOS_RESOURCE_TYPE:-gke-internal-project}}"
 
 ginkgo_focus="${E2E_TEST_FOCUS:-}"
 # TODO(amacaskill): Remove oidc from default skip when the test can be run without additional configuration.
-readonly ginkgo_skip="${E2E_TEST_SKIP:-should.succeed.in.performance.test|oidc}"
+readonly ginkgo_skip="${E2E_TEST_SKIP:-should.succeed.in.performance.test|should.succeed.in.memory.soak.test|oidc}"
 readonly ginkgo_procs="${E2E_TEST_GINKGO_PROCS:-40}"
-readonly ginkgo_timeout="${E2E_TEST_GINKGO_TIMEOUT:-4h}"
+readonly ginkgo_timeout="${E2E_TEST_GINKGO_TIMEOUT:-}"
 readonly ginkgo_flake_attempts="${E2E_TEST_GINKGO_FLAKE_ATTEMPTS:-2}"
 readonly gcsfuse_client_protocol=${GCSFUSE_CLIENT_PROTOCOL:-http1}
 readonly enable_zb=${ENABLE_ZB:-false}
@@ -70,6 +71,14 @@ fi
 readonly overlay
 readonly ginkgo_focus
 readonly gcsfuse_pr_number=${GCSFUSE_PR_NUMBER:-}
+csi_driver_memory_limit_arg=""
+if [ "${CSI_DRIVER_MEMORY_LIMIT+set}" = "set" ]; then
+  csi_driver_memory_limit_arg="--csi-driver-memory-limit=\"${CSI_DRIVER_MEMORY_LIMIT}\""
+fi
+readonly csi_driver_memory_limit_arg
+readonly soak_duration=${SOAK_DURATION:-}
+readonly soak_scrape_interval=${SOAK_SCRAPE_INTERVAL:-}
+readonly soak_pod_count=${SOAK_POD_COUNT:-}
 
 if [ "${skip_csi_driver_install}" = true ]; then
   use_gke_managed_driver=false
@@ -98,7 +107,8 @@ base_cmd="${PKGDIR}/bin/e2e-test-ci \
             --manage-cluster-lifecycle=${manage_cluster_lifecycle} \
             --use-boskos=${use_boskos} \
             --project-id=${project_id} \
-            --number-nodes=${num_nodes} \
+            ${num_nodes:+--number-nodes=${num_nodes}} \
+            ${node_machine_type:+--node-machine-type=${node_machine_type}} \
             --boskos-resource-type=${boskos_resource_type} \
             --gke-cluster-region=${gke_cluster_region} \
             --use-gke-autopilot=${use_gke_autopilot} \
@@ -115,7 +125,7 @@ base_cmd="${PKGDIR}/bin/e2e-test-ci \
             --ginkgo-focus=\"${ginkgo_focus}\" \
             --ginkgo-skip=\"${ginkgo_skip}\" \
             --ginkgo-procs=${ginkgo_procs} \
-            --ginkgo-timeout=${ginkgo_timeout} \
+            ${ginkgo_timeout:+--ginkgo-timeout=${ginkgo_timeout}} \
             --gcsfuse-client-protocol=${gcsfuse_client_protocol} \
             --ginkgo-flake-attempts=${ginkgo_flake_attempts} \
             --gcsfuse-enable-zb=${enable_zb} \
@@ -124,5 +134,9 @@ base_cmd="${PKGDIR}/bin/e2e-test-ci \
             --enable-gcsfuse-kernel-params=${enable_gcsfuse_kernel_params} \
             --enable-shared-mount=${enable_shared_mount} \
             --use-capacity-advisor=${use_capacity_advisor} \
-            ${gcsfuse_pr_number:+--gcsfuse-pr-number=${gcsfuse_pr_number}}"
+            ${gcsfuse_pr_number:+--gcsfuse-pr-number=${gcsfuse_pr_number}} \
+            ${csi_driver_memory_limit_arg} \
+            ${soak_duration:+--soak-duration=${soak_duration}} \
+            ${soak_scrape_interval:+--soak-scrape-interval=${soak_scrape_interval}} \
+            ${soak_pod_count:+--soak-pod-count=${soak_pod_count}}"
 eval "$base_cmd"

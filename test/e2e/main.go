@@ -21,6 +21,7 @@ import (
 	"flag"
 	"os"
 	"strings"
+	"time"
 
 	"local/test/e2e/utils"
 
@@ -76,6 +77,12 @@ var (
 	ginkgoTimeout       = flag.String("ginkgo-timeout", "4h", "pass to ginkgo run --timeout flag")
 	ginkgoFlakeAttempts = flag.String("ginkgo-flake-attempts", "2", "pass to ginkgo run --flake-attempts flag")
 	ginkgoSkipGcpSaTest = flag.Bool("ginkgo-skip-gcp-sa-test", true, "skip GCP SA test")
+
+	// Memory soak test flags (shared with e2e_test.go in package main).
+	csiDriverMemoryLimit = flag.String("csi-driver-memory-limit", "100Mi", "memory limit enforced on the CSI node driver container during the memory soak test")
+	soakDuration         = flag.Duration("soak-duration", 4*time.Hour, "duration of the CSI driver memory soak test")
+	soakScrapeInterval   = flag.Duration("soak-scrape-interval", 60*time.Second, "interval between active :9920/metrics scrapes during the memory soak test")
+	soakPodCount         = flag.Int("soak-pod-count", 80, "number of concurrent workload pods pinned to one node during the memory soak test")
 )
 
 func main() {
@@ -172,6 +179,10 @@ func main() {
 		SkipCSIDriverInstall:           *skipCSIDriverInstall,
 		GCSFusePRNumber:                *gcsFusePrNumber,
 		UseCapacityAdvisor:             *useCapacityAdvisor,
+		CSIDriverMemoryLimit:           *csiDriverMemoryLimit,
+		SoakDuration:                   soakDuration.String(),
+		SoakScrapeInterval:             soakScrapeInterval.String(),
+		SoakPodCount:                   *soakPodCount,
 	}
 
 	if strings.Contains(testParams.GinkgoFocus, "performance") {
@@ -180,6 +191,8 @@ func main() {
 		testParams.NumNodes = 1
 		testParams.NodeMachineType = "n2-standard-32"
 	}
+
+	utils.ApplyMemorySoakDefaults(testParams, explicitFlags)
 
 	if err := utils.Handle(testParams); err != nil {
 		klog.Fatalf("Failed to run e2e test: %v", err)

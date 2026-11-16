@@ -92,6 +92,10 @@ var _ = func() bool {
 
 	testsuites.LustreStorageClass = *lustreStorageClass
 	testsuites.GCSFuseVersionStr = specs.GetGCSFuseVersion()
+	testsuites.MemorySoakCSIDriverMemoryLimit = *csiDriverMemoryLimit
+	testsuites.MemorySoakDuration = *soakDuration
+	testsuites.MemorySoakScrapeInterval = *soakScrapeInterval
+	testsuites.MemorySoakPodCount = *soakPodCount
 	return true
 }()
 
@@ -120,6 +124,7 @@ var _ = ginkgo.Describe("E2E Test Suite", func() {
 			testsuites.InitGcsFuseCSIMultiVolumeTestSuite,
 			testsuites.InitGcsFuseCSIGCSFuseIntegrationTestSuite,
 			testsuites.InitGcsFuseCSIPerformanceTestSuite,
+			testsuites.InitGcsFuseCSIMemorySoakTestSuite,
 			testsuites.InitGcsFuseCSISubPathTestSuite,
 			testsuites.InitGcsFuseCSIAutoTerminationTestSuite,
 			testsuites.InitGcsFuseCSIFileCacheTestSuite,

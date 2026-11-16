@@ -468,12 +468,7 @@ func clusterUpGKE(testParams *TestParameters) error {
 
 	// Call update because --add-maintenance-exclusion is not an available flag during cluster creation.
 	startExclusionTime := time.Now().UTC()
-
-	exclusionDuration, parseErr := time.ParseDuration(testParams.GinkgoTimeout)
-	if parseErr != nil {
-		klog.Warningf("failed to parse ginkgo timeout %q, using default 4h for maintenance exclusion: %v", testParams.GinkgoTimeout, parseErr)
-		exclusionDuration = 4 * time.Hour
-	}
+	exclusionDuration := computeMaintenanceExclusionDuration(testParams.GinkgoTimeout)
 
 	//nolint:gosec
 	cmd = gcloudCommand(testParams, "container", "clusters", "update", testParams.GkeClusterName, "--region", testParams.GkeClusterRegion, "--project", testParams.ProjectID,
@@ -486,6 +481,23 @@ func clusterUpGKE(testParams *TestParameters) error {
 	}
 
 	return nil
+}
+
+const (
+	defaultMaintenanceExclusionBaseDuration = 4 * time.Hour
+	// maintenanceExclusionSetupBuffer covers pre-Ginkgo image build/push, driver install,
+	// and version discovery overhead so the no_upgrades window never expires mid-run.
+	maintenanceExclusionSetupBuffer = 2 * time.Hour
+)
+
+func computeMaintenanceExclusionDuration(ginkgoTimeout string) time.Duration {
+	baseDuration, parseErr := time.ParseDuration(ginkgoTimeout)
+	if parseErr != nil || baseDuration <= 0 {
+		klog.Warningf("failed to parse positive ginkgo timeout %q, using default %s for maintenance exclusion: %v",
+			ginkgoTimeout, defaultMaintenanceExclusionBaseDuration, parseErr)
+		baseDuration = defaultMaintenanceExclusionBaseDuration
+	}
+	return baseDuration + maintenanceExclusionSetupBuffer
 }
 
 func ClusterAtLeastMinVersion(clusterVersion, nodeVersion string, minVersion *version.Version) (bool, error) {

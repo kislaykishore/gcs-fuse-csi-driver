@@ -672,25 +672,39 @@ func (n *GCSFuseCSITestDriver) CreateTestFileWithSizeInBucket(ctx context.Contex
 	n.createTestFileInBucket(ctx, fileName, bucketName, make([]byte, fileSize))
 }
 
+func (n *GCSFuseCSITestDriver) CreateTestObjectInBucket(ctx context.Context, objectName, bucketName string, content []byte) {
+	n.createTestFileInBucket(ctx, objectName, bucketName, content)
+}
+
 func (n *GCSFuseCSITestDriver) createTestFileInBucket(ctx context.Context, fileName, bucketName string, fileContent []byte) {
 	storageService, err := n.prepareStorageService(ctx)
 	if err != nil {
 		e2eframework.Failf("failed to prepare storage service: %v", err)
 		return
 	}
+	defer storageService.Close()
 
-	err = os.WriteFile(fileName, fileContent, 0o600)
+	tmpFile, err := os.CreateTemp("", "gcsfuse-e2e-test-file-*")
 	if err != nil {
-		e2eframework.Failf("Failed to create a test file: %v", err)
+		e2eframework.Failf("Failed to create a temp test file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(fileContent); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		e2eframework.Failf("Failed to write temp test file: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		e2eframework.Failf("Failed to close temp test file: %v", err)
 	}
 	defer func() {
-		err = os.Remove(fileName)
-		if err != nil {
-			e2eframework.Failf("Failed to delete the empty data file: %v", err)
+		if err := os.Remove(tmpPath); err != nil {
+			e2eframework.Failf("Failed to delete the temp test file: %v", err)
 		}
 	}()
 
-	if err := storageService.UploadGCSObject(ctx, fileName, bucketName, fileName); err != nil {
+	if err := storageService.UploadGCSObject(ctx, tmpPath, bucketName, fileName); err != nil {
 		e2eframework.Failf("Failed to upload test file %q to GCS bucket %q: %v", fileName, bucketName, err)
 	}
 }

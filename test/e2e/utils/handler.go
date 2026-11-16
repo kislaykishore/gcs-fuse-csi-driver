@@ -23,11 +23,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -97,6 +100,11 @@ type TestParameters struct {
 	GkeGcloudCommand string
 	GkeGcloudArgs    string
 	GCSFusePRNumber  string
+
+	CSIDriverMemoryLimit string
+	SoakDuration         string
+	SoakScrapeInterval   string
+	SoakPodCount         int
 }
 
 const (
@@ -118,6 +126,10 @@ const (
 var skipDynamicPVTests = []string{"stable", "sidecar_bucket_access_check", "profiles", "shared-mount"}
 
 func Handle(testParams *TestParameters) error {
+	if err := ValidateMemorySoakParameters(testParams); err != nil {
+		return fmt.Errorf("invalid memory soak parameters: %w", err)
+	}
+
 	setTestEnvVars(testParams)
 
 	// Always ensure ProjectID is set and PROJECT env var is exported for all test runs.
@@ -377,8 +389,8 @@ func Handle(testParams *TestParameters) error {
 		}
 	}
 
-	//nolint:gosec
-	cmd := exec.Command("ginkgo", "run", "-v",
+	ginkgoArgs := []string{
+		"run", "-v",
 		"--procs", testParams.GinkgoProcs,
 		"--flake-attempts", testParams.GinkgoFlakeAttempts,
 		"--timeout", testParams.GinkgoTimeout,
@@ -386,7 +398,7 @@ func Handle(testParams *TestParameters) error {
 		"--skip", testSkipStr,
 		"--junit-report", "junit-gcsfusecsi.xml",
 		"--output-dir", artifactsDir,
-		testParams.PkgDir+"/test/e2e/",
+		testParams.PkgDir + "/test/e2e/",
 		"--",
 		"--client-protocol", testParams.GcsfuseClientProtocol,
 		"--provider", "skeleton",
@@ -397,12 +409,75 @@ func Handle(testParams *TestParameters) error {
 		fmt.Sprintf("--enable-gcsfuse-kernel-params-test=%s", strconv.FormatBool(testParams.EnableGCSFuseKernelParams)),
 		fmt.Sprintf("--enable-shared-mount-test=%s", strconv.FormatBool(testParams.EnableSharedMount)),
 		"--api-env", envAPIMap[testParams.APIEndpointOverride],
-	)
+	}
+	ginkgoArgs = append(ginkgoArgs, buildMemorySoakGinkgoArgs(testParams)...)
+
+	//nolint:gosec
+	cmd := exec.Command("ginkgo", ginkgoArgs...)
 
 	if err := runCommand("Running Ginkgo e2e test...", cmd); err != nil {
 		return fmt.Errorf("failed to run e2e tests with ginkgo: %w", err)
 	}
 
+	return nil
+}
+
+var memorySoakFocusPattern = regexp.MustCompile(`(?i)memory(?:[.\-\s_]|\\s|\.\*)+soak`)
+
+func isMemorySoakFocus(focus string) bool {
+	return memorySoakFocusPattern.MatchString(focus)
+}
+
+func buildMemorySoakGinkgoArgs(testParams *TestParameters) []string {
+	args := []string{
+		fmt.Sprintf("--csi-driver-memory-limit=%s", testParams.CSIDriverMemoryLimit),
+		fmt.Sprintf("--soak-pod-count=%d", testParams.SoakPodCount),
+	}
+	if testParams.SoakDuration != "" {
+		args = append(args, fmt.Sprintf("--soak-duration=%s", testParams.SoakDuration))
+	}
+	if testParams.SoakScrapeInterval != "" {
+		args = append(args, fmt.Sprintf("--soak-scrape-interval=%s", testParams.SoakScrapeInterval))
+	}
+	return args
+}
+
+// ValidateMemorySoakParameters validates memory soak runtime flags before cluster provisioning
+// when the Ginkgo focus targets the CSI memory soak test.
+func ValidateMemorySoakParameters(testParams *TestParameters) error {
+	if testParams == nil || !isMemorySoakFocus(testParams.GinkgoFocus) {
+		return nil
+	}
+	if testParams.SoakPodCount < 1 {
+		return fmt.Errorf("--soak-pod-count must be >= 1, got %d", testParams.SoakPodCount)
+	}
+	if testParams.SoakDuration != "" {
+		dur, err := time.ParseDuration(testParams.SoakDuration)
+		if err != nil {
+			return fmt.Errorf("invalid --soak-duration %q: %w", testParams.SoakDuration, err)
+		}
+		if dur <= 0 {
+			return fmt.Errorf("--soak-duration must be > 0, got %s", dur)
+		}
+	}
+	if testParams.SoakScrapeInterval != "" {
+		interval, err := time.ParseDuration(testParams.SoakScrapeInterval)
+		if err != nil {
+			return fmt.Errorf("invalid --soak-scrape-interval %q: %w", testParams.SoakScrapeInterval, err)
+		}
+		if interval <= 0 {
+			return fmt.Errorf("--soak-scrape-interval must be > 0, got %s", interval)
+		}
+	}
+	if testParams.CSIDriverMemoryLimit != "" {
+		qty, err := resource.ParseQuantity(testParams.CSIDriverMemoryLimit)
+		if err != nil {
+			return fmt.Errorf("invalid --csi-driver-memory-limit %q: %w", testParams.CSIDriverMemoryLimit, err)
+		}
+		if qty.Value() <= 0 {
+			return fmt.Errorf("--csi-driver-memory-limit must be > 0, got %q", testParams.CSIDriverMemoryLimit)
+		}
+	}
 	return nil
 }
 
@@ -417,11 +492,54 @@ func setTestEnvVars(testParams *TestParameters) {
 	}
 }
 
+// ApplyMemorySoakDefaults applies single-node, serial, no-flake-retry, and timeout defaults
+// when the Ginkgo focus targets the CSI memory soak test.
+func ApplyMemorySoakDefaults(testParams *TestParameters, explicitFlags map[string]bool) {
+	if !isMemorySoakFocus(testParams.GinkgoFocus) {
+		return
+	}
+
+	testParams.GinkgoSkip = ""
+	testParams.GinkgoProcs = "1"
+	testParams.GinkgoFlakeAttempts = "1"
+	if !explicitFlags["number-nodes"] {
+		testParams.NumNodes = 1
+	}
+	if !explicitFlags["node-machine-type"] {
+		testParams.NodeMachineType = "n2-standard-32"
+	}
+
+	soakDur := 4 * time.Hour
+	if testParams.SoakDuration != "" {
+		if parsed, err := time.ParseDuration(testParams.SoakDuration); err == nil && parsed > 0 {
+			soakDur = parsed
+		}
+	}
+	minTimeout := soakDur + time.Hour
+	currentTimeout, err := time.ParseDuration(testParams.GinkgoTimeout)
+	if !explicitFlags["ginkgo-timeout"] || err != nil || currentTimeout < minTimeout {
+		newTimeout := formatSoakTimeout(minTimeout)
+		klog.Infof("Setting ginkgo timeout for memory soak test to %s (soak duration=%s, previous=%q)", newTimeout, soakDur, testParams.GinkgoTimeout)
+		testParams.GinkgoTimeout = newTimeout
+	}
+}
+
+func formatSoakTimeout(d time.Duration) string {
+	if d > 0 && d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", int(d/time.Hour))
+	}
+	return d.String()
+}
+
 func generateTestSkip(testParams *TestParameters) string {
 	skipTests := []string{}
 
 	if testParams.GinkgoSkip != "" {
 		skipTests = append(skipTests, testParams.GinkgoSkip)
+	}
+
+	if !isMemorySoakFocus(testParams.GinkgoFocus) {
+		skipTests = append(skipTests, "should.succeed.in.memory.soak.test")
 	}
 
 	if !testParams.EnableGcsFuseProfiles {
