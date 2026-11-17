@@ -137,10 +137,29 @@ var (
 )
 
 type memorySoakScrapeAnalysis struct {
-	Bytes        int
-	SeriesCount  int
-	DistinctPods int
-	MissingPods  []string
+	Bytes              int
+	SeriesCount        int
+	DistinctPods       int
+	MissingPods        []string
+	MalformedLines     int
+	FirstMalformedLine string
+	ScannerErr         string
+	IncompletePods     []string
+	MissingGRPCPods    []string
+}
+
+// csiMetricsIncompleteLogPatterns matches pkg/metrics/metrics.go warning/error lines emitted when a
+// :9920/metrics scrape exhausts its sequential budget, skips mounts, fails to scrape/decode/process a
+// sidecar's metrics, or fails to encode a metric family.
+var csiMetricsIncompleteLogPatterns = []string{
+	"sequential metrics budget ",
+	"skipping metrics of ",
+	"failed to encode metric family ",
+	"failed to create scrape metrics request:",
+	"failed to scrape metrics:",
+	"unexpected HTTP status:",
+	"dropping the remaining metrics of pod ",
+	"dropping metrics of pod ",
 }
 
 type memorySoakSample struct {
@@ -382,6 +401,7 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 		framework.ExpectNoError(err, "workload pods did not become Running and Ready in time")
 
 		warmup := computeSoakWarmupDuration(MemorySoakDuration)
+		warmupStart := time.Now()
 		ginkgo.By(fmt.Sprintf("Warming up workload caches and metrics pipelines for %s", warmup))
 		if err := sleepWithContext(ctx, warmup); err != nil {
 			framework.Failf("Context cancelled during warmup: %v", err)
@@ -389,6 +409,13 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 
 		soakStart := time.Now()
 		soakEnd := soakStart.Add(MemorySoakDuration)
+		scrapeLogFloor := soakStart.Add(-5 * time.Second)
+		if scrapeLogFloor.Before(warmupStart) {
+			scrapeLogFloor = warmupStart
+		}
+		metricsLogCheckSince := soakStart
+		hasUnverifiedMetricsLogWindow := false
+		requireGRPCMetrics := strings.EqualFold(gcsfuseDriver.ClientProtocol, "grpc")
 		ginkgo.By(fmt.Sprintf("Starting memory soak loop for %s (scrape interval %s, %d pods, limit %s)",
 			MemorySoakDuration, MemorySoakScrapeInterval, MemorySoakPodCount, effectiveLimit))
 
@@ -444,15 +471,39 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 					sampleIdx, targetNode, strings.Join(oomEvents, "; "))
 			}
 
-			// 4. Now gate on the :9920/metrics scrape result and pod label coverage.
+			// 4. Gate on full :9920/metrics scrape completeness: HTTP/transport success, non-empty
+			// well-formed exposition, all expected soak pods present, complete per-pod FUSE/gRPC/histogram
+			// series, and zero CSI driver incomplete-scrape or budget-exhaustion log entries.
 			framework.ExpectNoError(scrapeErr, "[sample %d] failed to scrape %s/%s:9920/metrics", sampleIdx, csiNamespace, liveCSIPod.Name)
-			if len(scrapeBody) == 0 {
-				framework.Failf("[sample %d] received empty payload from %s/%s:9920/metrics", sampleIdx, csiNamespace, liveCSIPod.Name)
+			if fullScrapeErr := validateFullScrapeResult(
+				scrapeBody,
+				scrapeAnalysis,
+				MemorySoakPodCount,
+				namespace,
+				requireGRPCMetrics,
+			); fullScrapeErr != nil {
+				framework.Failf("[sample %d] %s/%s:9920/metrics full scrape check failed: %v",
+					sampleIdx, csiNamespace, liveCSIPod.Name, fullScrapeErr)
 			}
-			if scrapeAnalysis.DistinctPods != MemorySoakPodCount {
-				framework.Failf("[sample %d] expected metrics from %d distinct soak pods in namespace %q, got %d (series=%d, bytes=%d, missing=%v)",
-					sampleIdx, MemorySoakPodCount, namespace, scrapeAnalysis.DistinctPods,
-					scrapeAnalysis.SeriesCount, scrapeAnalysis.Bytes, truncateStrings(scrapeAnalysis.MissingPods, 10))
+			logFetchTime := time.Now()
+			incompleteLogLines, logErr := checkCSIMetricsIncompleteLogs(
+				ctx,
+				client,
+				csiNamespace,
+				liveCSIPod.Name,
+				metricsLogCheckSince,
+				scrapeLogFloor,
+			)
+			if logErr != nil {
+				hasUnverifiedMetricsLogWindow = true
+				framework.Logf("[sample %d] Warning: failed to inspect CSI driver logs for incomplete metrics scrapes: %v", sampleIdx, logErr)
+			} else {
+				hasUnverifiedMetricsLogWindow = false
+				metricsLogCheckSince = logFetchTime
+				if len(incompleteLogLines) > 0 {
+					framework.Failf("[sample %d] CSI driver %s/%s logged incomplete metrics scrape: %s",
+						sampleIdx, csiNamespace, liveCSIPod.Name, strings.Join(truncateStrings(incompleteLogLines, 5), "; "))
+				}
 			}
 
 			// 5. Verify all workload pods remain Running and Ready on targetNode.
@@ -518,6 +569,22 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 				if err := sleepWithContext(ctx, sleepDur); err != nil {
 					framework.Failf("Context cancelled during memory soak loop: %v", err)
 				}
+			}
+		}
+
+		if hasUnverifiedMetricsLogWindow {
+			incompleteLogLines, logErr := checkCSIMetricsIncompleteLogs(
+				ctx,
+				client,
+				csiNamespace,
+				csiPod.Name,
+				metricsLogCheckSince,
+				scrapeLogFloor,
+			)
+			framework.ExpectNoError(logErr, "failed final CSI driver log verification for incomplete metrics scrapes")
+			if len(incompleteLogLines) > 0 {
+				framework.Failf("CSI driver %s/%s logged incomplete metrics scrape: %s",
+					csiNamespace, csiPod.Name, strings.Join(truncateStrings(incompleteLogLines, 5), "; "))
 			}
 		}
 
@@ -826,8 +893,137 @@ func checkWorkloadPodsHealth(pods []corev1.Pod, expectedCount int, targetNode st
 	return nil
 }
 
+type promComplexSeriesState uint8
+
+const (
+	promSeriesComplete promComplexSeriesState = iota
+	promHistInBuckets
+	promSeriesSawSum
+	promSummaryInQuantiles
+	promSeriesBroken
+)
+
+type podScrapeCompleteness struct {
+	hasFUSEOpsMetric bool
+	hasGRPCMetric    bool
+	histograms       map[string]promComplexSeriesState
+	summaries        map[string]promComplexSeriesState
+}
+
+func isSoakFUSEOpsMetric(metricName string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(metricName, "volume_"), "fs_ops_")
+}
+
+func isSoakGRPCMetric(metricName string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(metricName, "volume_"), "grpc_")
+}
+
+func truncateText(s string, maxChars int) string {
+	if len(s) <= maxChars {
+		return s
+	}
+	return s[:maxChars] + "..."
+}
+
+func updatePodComplexSeriesState(
+	ps *podScrapeCompleteness,
+	metricName string,
+	knownHistograms, knownSummaries map[string]struct{},
+) {
+	if base, isBucket := strings.CutSuffix(metricName, "_bucket"); isBucket && base != "" {
+		if ps.histograms == nil {
+			ps.histograms = make(map[string]promComplexSeriesState, 8)
+		}
+		cur := ps.histograms[base]
+		if cur == promSeriesComplete || cur == promHistInBuckets {
+			ps.histograms[base] = promHistInBuckets
+		} else {
+			ps.histograms[base] = promSeriesBroken
+		}
+		return
+	}
+
+	if base, isSum := strings.CutSuffix(metricName, "_sum"); isSum && base != "" {
+		if _, isHist := knownHistograms[base]; isHist {
+			if ps.histograms == nil {
+				ps.histograms = make(map[string]promComplexSeriesState, 8)
+			}
+			if ps.histograms[base] == promHistInBuckets {
+				ps.histograms[base] = promSeriesSawSum
+			} else {
+				ps.histograms[base] = promSeriesBroken
+			}
+			return
+		}
+		if _, isSummary := knownSummaries[base]; isSummary {
+			if ps.summaries == nil {
+				ps.summaries = make(map[string]promComplexSeriesState, 4)
+			}
+			cur := ps.summaries[base]
+			if cur == promSeriesComplete || cur == promSummaryInQuantiles {
+				ps.summaries[base] = promSeriesSawSum
+			} else {
+				ps.summaries[base] = promSeriesBroken
+			}
+			return
+		}
+	}
+
+	if base, isCount := strings.CutSuffix(metricName, "_count"); isCount && base != "" {
+		if _, isHist := knownHistograms[base]; isHist {
+			if ps.histograms == nil {
+				ps.histograms = make(map[string]promComplexSeriesState, 8)
+			}
+			if ps.histograms[base] == promSeriesSawSum {
+				ps.histograms[base] = promSeriesComplete
+			} else {
+				ps.histograms[base] = promSeriesBroken
+			}
+			return
+		}
+		if _, isSummary := knownSummaries[base]; isSummary {
+			if ps.summaries == nil {
+				ps.summaries = make(map[string]promComplexSeriesState, 4)
+			}
+			if ps.summaries[base] == promSeriesSawSum {
+				ps.summaries[base] = promSeriesComplete
+			} else {
+				ps.summaries[base] = promSeriesBroken
+			}
+			return
+		}
+	}
+
+	if _, isSummary := knownSummaries[metricName]; isSummary {
+		if ps.summaries == nil {
+			ps.summaries = make(map[string]promComplexSeriesState, 4)
+		}
+		cur := ps.summaries[metricName]
+		if cur == promSeriesComplete || cur == promSummaryInQuantiles {
+			ps.summaries[metricName] = promSummaryInQuantiles
+		} else {
+			ps.summaries[metricName] = promSeriesBroken
+		}
+	}
+}
+
+func firstIncompleteSeriesName(states map[string]promComplexSeriesState) string {
+	var broken []string
+	for name, st := range states {
+		if st != promSeriesComplete {
+			broken = append(broken, name)
+		}
+	}
+	if len(broken) == 0 {
+		return ""
+	}
+	sort.Strings(broken)
+	return broken[0]
+}
+
 // analyzeScrapePayload scans Prometheus exposition text from :9920/metrics, counting non-comment
-// metric series and distinct pod_name labels belonging to namespace (and expectedPods when non-empty).
+// metric series, distinct pod_name labels belonging to namespace (and expectedPods when non-empty),
+// malformed/truncated exposition lines, scanner errors, and per-pod FUSE/gRPC/histogram/summary completeness.
 func analyzeScrapePayload(payload []byte, namespace string, expectedPods map[string]struct{}) memorySoakScrapeAnalysis {
 	res := memorySoakScrapeAnalysis{
 		Bytes: len(payload),
@@ -836,15 +1032,49 @@ func analyzeScrapePayload(payload []byte, namespace string, expectedPods map[str
 		return res
 	}
 
-	seenPods := make(map[string]struct{})
+	knownHistograms := make(map[string]struct{}, 16)
+	knownSummaries := make(map[string]struct{}, 4)
+	podStates := make(map[string]*podScrapeCompleteness, len(expectedPods))
+	lastLineWasHeaderComment := false
+
 	scanner := bufio.NewScanner(bytes.NewReader(payload))
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
-		_, labels, _, ok := parsePromSampleLine(scanner.Text())
+		trimmed := strings.TrimSpace(scanner.Text())
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			lastLineWasHeaderComment = trimmed != "# EOF"
+			if rest, ok := strings.CutPrefix(trimmed, "# TYPE "); ok {
+				rest = strings.TrimSpace(rest)
+				if sep := strings.IndexAny(rest, " \t"); sep > 0 {
+					famName := rest[:sep]
+					famType := strings.TrimSpace(rest[sep+1:])
+					switch famType {
+					case "histogram", "gaugehistogram":
+						knownHistograms[famName] = struct{}{}
+					case "summary":
+						knownSummaries[famName] = struct{}{}
+					}
+				}
+			}
+			continue
+		}
+		lastLineWasHeaderComment = false
+
+		metricName, labels, _, ok := parsePromSampleLine(trimmed)
 		if !ok {
+			res.MalformedLines++
+			if res.FirstMalformedLine == "" {
+				res.FirstMalformedLine = truncateText(trimmed, 160)
+			}
 			continue
 		}
 		res.SeriesCount++
+		if base, isBucket := strings.CutSuffix(metricName, "_bucket"); isBucket && base != "" {
+			knownHistograms[base] = struct{}{}
+		}
 		if labels == "" {
 			continue
 		}
@@ -863,21 +1093,99 @@ func analyzeScrapePayload(payload []byte, namespace string, expectedPods map[str
 				continue
 			}
 		}
-		seenPods[podVal] = struct{}{}
+		ps := podStates[podVal]
+		if ps == nil {
+			ps = &podScrapeCompleteness{}
+			podStates[podVal] = ps
+		}
+		if isSoakFUSEOpsMetric(metricName) {
+			ps.hasFUSEOpsMetric = true
+		}
+		if isSoakGRPCMetric(metricName) {
+			ps.hasGRPCMetric = true
+		}
+		updatePodComplexSeriesState(ps, metricName, knownHistograms, knownSummaries)
 	}
 
-	res.DistinctPods = len(seenPods)
-	if len(expectedPods) > 0 && len(seenPods) < len(expectedPods) {
-		missing := make([]string, 0, len(expectedPods)-len(seenPods))
+	if err := scanner.Err(); err != nil {
+		res.ScannerErr = err.Error()
+	}
+	if lastLineWasHeaderComment {
+		res.MalformedLines++
+		if res.FirstMalformedLine == "" {
+			res.FirstMalformedLine = "trailing comment/header line with no metric samples"
+		}
+	}
+
+	res.DistinctPods = len(podStates)
+	if len(expectedPods) > 0 && len(podStates) < len(expectedPods) {
+		missing := make([]string, 0, len(expectedPods)-len(podStates))
 		for podName := range expectedPods {
-			if _, ok := seenPods[podName]; !ok {
+			if _, ok := podStates[podName]; !ok {
 				missing = append(missing, podName)
 			}
 		}
 		sort.Strings(missing)
 		res.MissingPods = missing
 	}
+
+	seenPodNames := make([]string, 0, len(podStates))
+	for podName := range podStates {
+		seenPodNames = append(seenPodNames, podName)
+	}
+	sort.Strings(seenPodNames)
+
+	for _, podName := range seenPodNames {
+		ps := podStates[podName]
+		switch {
+		case !ps.hasFUSEOpsMetric:
+			res.IncompletePods = append(res.IncompletePods, fmt.Sprintf("%s(missing fs_ops_* metrics)", podName))
+		case firstIncompleteSeriesName(ps.histograms) != "":
+			res.IncompletePods = append(res.IncompletePods, fmt.Sprintf("%s(truncated histogram %s)", podName, firstIncompleteSeriesName(ps.histograms)))
+		case firstIncompleteSeriesName(ps.summaries) != "":
+			res.IncompletePods = append(res.IncompletePods, fmt.Sprintf("%s(truncated summary %s)", podName, firstIncompleteSeriesName(ps.summaries)))
+		}
+		if !ps.hasGRPCMetric {
+			res.MissingGRPCPods = append(res.MissingGRPCPods, podName)
+		}
+	}
+
 	return res
+}
+
+// validateFullScrapeResult verifies that a :9920/metrics HTTP 200 payload represents a complete,
+// untruncated scrape across all expected soak pods.
+func validateFullScrapeResult(
+	scrapeBody []byte,
+	analysis memorySoakScrapeAnalysis,
+	expectedPodCount int,
+	namespace string,
+	requireGRPCMetrics bool,
+) error {
+	if len(scrapeBody) == 0 {
+		return errors.New("received empty metrics payload")
+	}
+	if analysis.ScannerErr != "" {
+		return fmt.Errorf("metrics payload scanner error: %s", analysis.ScannerErr)
+	}
+	if analysis.MalformedLines > 0 {
+		return fmt.Errorf("metrics payload truncated or malformed (%d malformed line(s), first=%q)",
+			analysis.MalformedLines, analysis.FirstMalformedLine)
+	}
+	if analysis.DistinctPods != expectedPodCount {
+		return fmt.Errorf("incomplete metrics scrape: expected %d distinct soak pods in namespace %q, got %d (series=%d, bytes=%d, missing=%v)",
+			expectedPodCount, namespace, analysis.DistinctPods,
+			analysis.SeriesCount, analysis.Bytes, truncateStrings(analysis.MissingPods, 10))
+	}
+	if len(analysis.IncompletePods) > 0 {
+		return fmt.Errorf("incomplete per-pod metrics in scrape payload (series=%d, bytes=%d, incomplete=%v)",
+			analysis.SeriesCount, analysis.Bytes, truncateStrings(analysis.IncompletePods, 10))
+	}
+	if requireGRPCMetrics && len(analysis.MissingGRPCPods) > 0 {
+		return fmt.Errorf("incomplete metrics scrape for gRPC protocol: %d/%d soak pods missing grpc_* metrics (missing=%v)",
+			len(analysis.MissingGRPCPods), expectedPodCount, truncateStrings(analysis.MissingGRPCPods, 10))
+	}
+	return nil
 }
 
 // parseStatsSummaryMemory extracts workingSetBytes and rssBytes for the specified CSI pod container
@@ -957,6 +1265,34 @@ func parseCadvisorMemoryPeak(data []byte, csiNamespace, csiPodName, containerNam
 	return maxUsageBytes, found
 }
 
+func hasValidPromSampleValue(rest string) bool {
+	if rest == "" {
+		return false
+	}
+	sep := strings.IndexAny(rest, " \t")
+	if sep < 0 {
+		_, err := strconv.ParseFloat(rest, 64)
+		return err == nil
+	}
+	if _, err := strconv.ParseFloat(rest[:sep], 64); err != nil {
+		return false
+	}
+	afterVal := strings.TrimSpace(rest[sep+1:])
+	if afterVal == "" || strings.HasPrefix(afterVal, "#") {
+		return true
+	}
+	tsToken := afterVal
+	if tsSep := strings.IndexAny(afterVal, " \t"); tsSep >= 0 {
+		tsToken = afterVal[:tsSep]
+		trailing := strings.TrimSpace(afterVal[tsSep+1:])
+		if trailing != "" && !strings.HasPrefix(trailing, "#") {
+			return false
+		}
+	}
+	_, err := strconv.ParseInt(tsToken, 10, 64)
+	return err == nil
+}
+
 // parsePromSampleLine parses a single non-comment Prometheus exposition sample line into
 // metricName, labels substring (without enclosing braces), and trailing value/timestamp text.
 func parsePromSampleLine(line string) (metricName, labels, rest string, ok bool) {
@@ -968,10 +1304,15 @@ func parsePromSampleLine(line string) (metricName, labels, rest string, ok bool)
 	openBrace := strings.IndexByte(trimmed, '{')
 	if openBrace < 0 {
 		idx := strings.IndexAny(trimmed, " \t")
-		if idx < 0 {
+		if idx <= 0 {
 			return "", "", "", false
 		}
-		return trimmed[:idx], "", strings.TrimSpace(trimmed[idx+1:]), true
+		name := trimmed[:idx]
+		tail := strings.TrimSpace(trimmed[idx+1:])
+		if !hasValidPromSampleValue(tail) {
+			return "", "", "", false
+		}
+		return name, "", tail, true
 	}
 
 	inQuotes := false
@@ -1001,7 +1342,15 @@ func parsePromSampleLine(line string) (metricName, labels, rest string, ok bool)
 	if closeBrace < 0 {
 		return "", "", "", false
 	}
-	return strings.TrimSpace(trimmed[:openBrace]), trimmed[openBrace+1 : closeBrace], strings.TrimSpace(trimmed[closeBrace+1:]), true
+	name := strings.TrimSpace(trimmed[:openBrace])
+	if name == "" || strings.IndexAny(name, " \t") >= 0 {
+		return "", "", "", false
+	}
+	tail := strings.TrimSpace(trimmed[closeBrace+1:])
+	if !hasValidPromSampleValue(tail) {
+		return "", "", "", false
+	}
+	return name, trimmed[openBrace+1 : closeBrace], tail, true
 }
 
 // extractPromLabelValue extracts the unescaped value of targetKey from a Prometheus labels block
@@ -1770,10 +2119,11 @@ func scrapeAndAnalyzeCSIMetricsWithFunc(
 		lastDur = dur
 		lastErr = err
 		if err == nil {
+			// Return HTTP 200 responses immediately without retrying so partial, empty, or truncated
+			// scrapes fail Step 4 instead of being masked by retry attempts. Retries apply strictly
+			// to transient K8s API / Konnectivity proxy transport errors (err != nil).
 			lastAnalysis = analyzeScrapePayload(body, workloadNamespace, expectedPods)
-			if len(body) > 0 && lastAnalysis.DistinctPods == len(expectedPods) {
-				return lastBody, lastDur, lastAnalysis, nil
-			}
+			return lastBody, lastDur, lastAnalysis, nil
 		}
 
 		if ctx.Err() != nil {
@@ -1788,18 +2138,15 @@ func scrapeAndAnalyzeCSIMetricsWithFunc(
 					}
 					framework.Logf("Aborting :9920/metrics scrape retries on attempt %d/%d because CSI driver is unhealthy: %v",
 						attempt, maxAttempts, healthErr)
-					if lastErr != nil {
-						return lastBody, lastDur, lastAnalysis, fmt.Errorf("scrape failed (%w) and CSI driver unhealthy: %w", lastErr, healthErr)
-					}
-					return lastBody, lastDur, lastAnalysis, fmt.Errorf("CSI driver unhealthy during metrics scrape: %w", healthErr)
+					return lastBody, lastDur, lastAnalysis, fmt.Errorf("scrape failed (%w) and CSI driver unhealthy: %w", lastErr, healthErr)
 				}
 			}
 			prefix := ""
 			if isFirstScrape {
 				prefix = "Initial "
 			}
-			framework.Logf("%s:9920/metrics scrape attempt %d/%d incomplete (err=%v, bytes=%d, distinctPods=%d/%d); retrying in %s",
-				prefix, attempt, maxAttempts, err, len(body), lastAnalysis.DistinctPods, len(expectedPods), retryDelay)
+			framework.Logf("%s:9920/metrics scrape attempt %d/%d failed with transport error (%v); retrying in %s",
+				prefix, attempt, maxAttempts, err, retryDelay)
 			if sleepErr := sleepWithContext(ctx, retryDelay); sleepErr != nil {
 				return lastBody, lastDur, lastAnalysis, sleepErr
 			}
@@ -1807,6 +2154,65 @@ func scrapeAndAnalyzeCSIMetricsWithFunc(
 	}
 
 	return lastBody, lastDur, lastAnalysis, lastErr
+}
+
+func checkCSIMetricsIncompleteLogs(
+	ctx context.Context,
+	client clientset.Interface,
+	csiNamespace, csiPodName string,
+	since, notBefore time.Time,
+) ([]string, error) {
+	querySince := since.Add(-2 * time.Second).Truncate(time.Second)
+	floor := notBefore.Truncate(time.Second)
+	if !notBefore.IsZero() && querySince.Before(floor) {
+		querySince = floor
+	}
+	sinceMeta := metav1.NewTime(querySince)
+	rawLogs, err := retryTransientK8sAPICall(ctx, "fetch CSI driver metrics logs", func(callCtx context.Context) ([]byte, error) {
+		logCtx, cancel := context.WithTimeout(callCtx, memorySoakDiagTimeout)
+		defer cancel()
+		return client.CoreV1().Pods(csiNamespace).GetLogs(csiPodName, &corev1.PodLogOptions{
+			Container:  memorySoakCSIContainerName,
+			SinceTime:  &sinceMeta,
+			Timestamps: true,
+		}).DoRaw(logCtx)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return findCSIMetricsIncompleteLogs(string(rawLogs), notBefore), nil
+}
+
+func findCSIMetricsIncompleteLogs(logText string, notBefore time.Time) []string {
+	if logText == "" {
+		return nil
+	}
+	var matches []string
+	scanner := bufio.NewScanner(strings.NewReader(logText))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		// When PodLogOptions{Timestamps: true} is used, kubelet prefixes each line with an RFC3339Nano
+		// timestamp (e.g. "2026-11-17T07:03:52.812345678Z E1117 ..."). Filter out lines strictly before
+		// notBefore so <=1s SinceTime truncation never matches pre-soak warmup logs.
+		if !notBefore.IsZero() {
+			if sep := strings.IndexByte(line, ' '); sep > 0 {
+				if ts, err := time.Parse(time.RFC3339Nano, line[:sep]); err == nil && ts.Before(notBefore) {
+					continue
+				}
+			}
+		}
+		for _, pattern := range csiMetricsIncompleteLogPatterns {
+			if strings.Contains(line, pattern) {
+				matches = append(matches, line)
+				break
+			}
+		}
+	}
+	return matches
 }
 
 func listCSIOOMKillingEvents(ctx context.Context, client clientset.Interface, csiPodName, targetNode string, since time.Time) ([]string, error) {

@@ -617,11 +617,150 @@ func TestAnalyzeScrapePayload(t *testing.T) {
 	if diff := cmp.Diff([]string{"pod-3"}, got.MissingPods); diff != "" {
 		t.Errorf("MissingPods mismatch (-want +got):\n%s", diff)
 	}
+	if got.MalformedLines != 0 || got.ScannerErr != "" || len(got.IncompletePods) != 0 {
+		t.Errorf("expected no structural errors on valid payload, got %+v", got)
+	}
+	if diff := cmp.Diff([]string{"pod-2"}, got.MissingGRPCPods); diff != "" {
+		t.Errorf("MissingGRPCPods mismatch (-want +got):\n%s", diff)
+	}
 
 	empty := analyzeScrapePayload(nil, "soak-ns", expected)
 	if empty.Bytes != 0 || empty.SeriesCount != 0 || empty.DistinctPods != 0 {
 		t.Errorf("unexpected non-zero result for empty payload: %+v", empty)
 	}
+
+	twoPods := map[string]struct{}{
+		"pod-1": {},
+		"pod-2": {},
+	}
+
+	t.Run("complete multi-pod FUSE, gRPC, and multi-series histogram payload passes full scrape validation", func(t *testing.T) {
+		t.Parallel()
+		complete := strings.Join([]string{
+			`# HELP volume_fs_ops_count Total number of fs ops`,
+			`# TYPE volume_fs_ops_count counter`,
+			`volume_fs_ops_count{fs_op="ReadFile",namespace_name="soak-ns",pod_name="pod-1"} 12`,
+			`volume_fs_ops_count{fs_op="ReadFile",namespace_name="soak-ns",pod_name="pod-2"} 15`,
+			`# TYPE volume_fs_ops_latencies histogram`,
+			`volume_fs_ops_latencies_bucket{fs_op="OpenFile",le="10",namespace_name="soak-ns",pod_name="pod-1"} 3`,
+			`volume_fs_ops_latencies_bucket{fs_op="OpenFile",le="+Inf",namespace_name="soak-ns",pod_name="pod-1"} 4`,
+			`volume_fs_ops_latencies_sum{fs_op="OpenFile",namespace_name="soak-ns",pod_name="pod-1"} 18.5`,
+			`volume_fs_ops_latencies_count{fs_op="OpenFile",namespace_name="soak-ns",pod_name="pod-1"} 4`,
+			`volume_fs_ops_latencies_bucket{fs_op="ReadFile",le="+Inf",namespace_name="soak-ns",pod_name="pod-1"} 8`,
+			`volume_fs_ops_latencies_sum{fs_op="ReadFile",namespace_name="soak-ns",pod_name="pod-1"} 42.0`,
+			`volume_fs_ops_latencies_count{fs_op="ReadFile",namespace_name="soak-ns",pod_name="pod-1"} 8`,
+			`volume_fs_ops_latencies_bucket{fs_op="ReadFile",le="+Inf",namespace_name="soak-ns",pod_name="pod-2"} 6`,
+			`volume_fs_ops_latencies_sum{fs_op="ReadFile",namespace_name="soak-ns",pod_name="pod-2"} 21.0`,
+			`volume_fs_ops_latencies_count{fs_op="ReadFile",namespace_name="soak-ns",pod_name="pod-2"} 6`,
+			`# TYPE grpc_client_attempt_started counter`,
+			`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-1"} 5`,
+			`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-2"} 7`,
+			`# EOF`,
+		}, "\n")
+
+		analysis := analyzeScrapePayload([]byte(complete), "soak-ns", twoPods)
+		if err := validateFullScrapeResult([]byte(complete), analysis, 2, "soak-ns", true); err != nil {
+			t.Fatalf("expected complete scrape to pass, got error: %v (analysis=%+v)", err, analysis)
+		}
+	})
+
+	t.Run("detects mid-line and missing-value truncation", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range []struct {
+			name string
+			tail string
+		}{
+			{name: "unclosed braces", tail: `volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-2"`},
+			{name: "missing sample value", tail: `volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-2"}`},
+			{name: "corrupt float value", tail: `volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-2"} 12abc`},
+			{name: "dangling TYPE header at EOF", tail: `# TYPE grpc_client_attempt_started counter`},
+		} {
+			body := []byte(strings.Join([]string{
+				`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-1"} 10`,
+				`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-1"} 2`,
+				`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-2"} 11`,
+				`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-2"} 3`,
+				tc.tail,
+			}, "\n"))
+			analysis := analyzeScrapePayload(body, "soak-ns", twoPods)
+			if analysis.MalformedLines == 0 {
+				t.Errorf("%s: expected MalformedLines > 0, got %+v", tc.name, analysis)
+			}
+			if err := validateFullScrapeResult(body, analysis, 2, "soak-ns", true); err == nil {
+				t.Errorf("%s: expected validateFullScrapeResult error, got nil", tc.name)
+			}
+		}
+	})
+
+	t.Run("detects histogram truncated on second label series of last pod", func(t *testing.T) {
+		t.Parallel()
+		truncatedHist := []byte(strings.Join([]string{
+			`# TYPE volume_fs_ops_count counter`,
+			`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-1"} 10`,
+			`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-2"} 12`,
+			`# TYPE grpc_client_attempt_started counter`,
+			`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-1"} 3`,
+			`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-2"} 4`,
+			`# TYPE volume_fs_ops_latencies histogram`,
+			`volume_fs_ops_latencies_bucket{fs_op="OpenFile",le="+Inf",namespace_name="soak-ns",pod_name="pod-2"} 2`,
+			`volume_fs_ops_latencies_sum{fs_op="OpenFile",namespace_name="soak-ns",pod_name="pod-2"} 5.0`,
+			`volume_fs_ops_latencies_count{fs_op="OpenFile",namespace_name="soak-ns",pod_name="pod-2"} 2`,
+			// Second series on pod-2 cut off after _bucket (before _sum and _count):
+			`volume_fs_ops_latencies_bucket{fs_op="ReadFile",le="10",namespace_name="soak-ns",pod_name="pod-2"} 7`,
+		}, "\n"))
+		analysis := analyzeScrapePayload(truncatedHist, "soak-ns", twoPods)
+		if len(analysis.IncompletePods) != 1 || !strings.Contains(analysis.IncompletePods[0], "pod-2(truncated histogram volume_fs_ops_latencies)") {
+			t.Fatalf("expected pod-2 truncated histogram in IncompletePods, got %+v", analysis.IncompletePods)
+		}
+		if err := validateFullScrapeResult(truncatedHist, analysis, 2, "soak-ns", true); err == nil {
+			t.Fatal("expected validateFullScrapeResult to reject truncated histogram, got nil")
+		}
+	})
+
+	t.Run("detects last mount cut off mid-stream before grpc_* or fs_ops_* families", func(t *testing.T) {
+		t.Parallel()
+		// pod-2 emitted volume_fs_ops_count (so DistinctPods == 2), then timed out before grpc_*.
+		missingGRPCOnPod2 := []byte(strings.Join([]string{
+			`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-1"} 10`,
+			`grpc_client_attempt_started{namespace_name="soak-ns",pod_name="pod-1"} 3`,
+			`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-2"} 12`,
+		}, "\n"))
+		analysis := analyzeScrapePayload(missingGRPCOnPod2, "soak-ns", twoPods)
+		if analysis.DistinctPods != 2 {
+			t.Fatalf("got DistinctPods=%d, want 2", analysis.DistinctPods)
+		}
+		if err := validateFullScrapeResult(missingGRPCOnPod2, analysis, 2, "soak-ns", true); err == nil {
+			t.Fatal("expected error when pod-2 is missing grpc_* metrics under gRPC protocol, got nil")
+		}
+		if err := validateFullScrapeResult(missingGRPCOnPod2, analysis, 2, "soak-ns", false); err != nil {
+			t.Fatalf("expected HTTP protocol validation to allow missing grpc_* metrics, got: %v", err)
+		}
+
+		// pod-2 emitted volume_file_cache_read_count first, then cut off before volume_fs_ops_*.
+		missingFUSEOnPod2 := []byte(strings.Join([]string{
+			`volume_fs_ops_count{namespace_name="soak-ns",pod_name="pod-1"} 10`,
+			`volume_file_cache_read_count{namespace_name="soak-ns",pod_name="pod-2"} 4`,
+		}, "\n"))
+		fuseAnalysis := analyzeScrapePayload(missingFUSEOnPod2, "soak-ns", twoPods)
+		if len(fuseAnalysis.IncompletePods) != 1 || !strings.Contains(fuseAnalysis.IncompletePods[0], "pod-2(missing fs_ops_* metrics)") {
+			t.Fatalf("expected pod-2 missing fs_ops_* in IncompletePods, got %+v", fuseAnalysis.IncompletePods)
+		}
+		if err := validateFullScrapeResult(missingFUSEOnPod2, fuseAnalysis, 2, "soak-ns", false); err == nil {
+			t.Fatal("expected error when pod-2 is missing fs_ops_* metrics even under HTTP protocol, got nil")
+		}
+	})
+
+	t.Run("surfaces scanner error when line exceeds 4 MiB scanner buffer", func(t *testing.T) {
+		t.Parallel()
+		oversized := []byte("go_info{blob=\"" + strings.Repeat("a", 4*1024*1024+128) + "\"} 1\n")
+		analysis := analyzeScrapePayload(oversized, "soak-ns", twoPods)
+		if analysis.ScannerErr == "" {
+			t.Fatalf("expected non-empty ScannerErr for >4 MiB line, got %+v", analysis)
+		}
+		if err := validateFullScrapeResult(oversized, analysis, 2, "soak-ns", false); err == nil {
+			t.Fatal("expected validateFullScrapeResult error on ScannerErr, got nil")
+		}
+	})
 }
 
 func TestParseStatsSummaryMemory(t *testing.T) {
@@ -1456,13 +1595,56 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 		}
 	})
 
-	t.Run("resets lastAnalysis when subsequent retry fails with transport error", func(t *testing.T) {
+	t.Run("does not retry partial or empty HTTP 200 payload", func(t *testing.T) {
+		for _, isFirst := range []bool{false, true} {
+			var attempts, healthChecks int
+			scrapeFn := func(_ context.Context) ([]byte, error) {
+				attempts++
+				return partialPayload, nil
+			}
+			healthCheck := func(_ context.Context) error {
+				healthChecks++
+				return nil
+			}
+
+			body, _, analysis, err := scrapeAndAnalyzeCSIMetricsWithFunc(ctx, scrapeFn, "soak-ns", expectedPods, isFirst, healthCheck)
+			if err != nil {
+				t.Fatalf("isFirst=%v: unexpected transport error on HTTP 200: %v", isFirst, err)
+			}
+			if attempts != 1 {
+				t.Errorf("isFirst=%v: got %d attempts on partial HTTP 200, want 1 (must fail Step 4 immediately without retry)", isFirst, attempts)
+			}
+			if healthChecks != 0 {
+				t.Errorf("isFirst=%v: got %d health checks on HTTP 200, want 0", isFirst, healthChecks)
+			}
+			if analysis.DistinctPods != 1 {
+				t.Errorf("isFirst=%v: got DistinctPods=%d, want 1", isFirst, analysis.DistinctPods)
+			}
+			if fullErr := validateFullScrapeResult(body, analysis, len(expectedPods), "soak-ns", false); fullErr == nil {
+				t.Errorf("isFirst=%v: expected validateFullScrapeResult to reject partial HTTP 200 scrape", isFirst)
+			}
+		}
+
+		var emptyAttempts int
+		emptyBody, _, emptyAnalysis, emptyErr := scrapeAndAnalyzeCSIMetricsWithFunc(ctx, func(_ context.Context) ([]byte, error) {
+			emptyAttempts++
+			return []byte{}, nil
+		}, "soak-ns", expectedPods, true, nil)
+		if emptyErr != nil {
+			t.Fatalf("unexpected transport error on empty HTTP 200: %v", emptyErr)
+		}
+		if emptyAttempts != 1 {
+			t.Errorf("got %d attempts on empty HTTP 200, want 1", emptyAttempts)
+		}
+		if fullErr := validateFullScrapeResult(emptyBody, emptyAnalysis, len(expectedPods), "soak-ns", false); fullErr == nil {
+			t.Error("expected validateFullScrapeResult to reject empty HTTP 200 scrape")
+		}
+	})
+
+	t.Run("returns zeroed analysis when all transport retries fail", func(t *testing.T) {
 		var attempts int
 		scrapeFn := func(_ context.Context) ([]byte, error) {
 			attempts++
-			if attempts == 1 {
-				return partialPayload, nil
-			}
 			return nil, errors.New("EOF")
 		}
 
@@ -1479,7 +1661,7 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 			t.Errorf("expected empty body on transport failure, got %d bytes", len(body))
 		}
 		if analysis.Bytes != 0 || analysis.SeriesCount != 0 || analysis.DistinctPods != 0 || len(analysis.MissingPods) != 0 {
-			t.Errorf("expected zeroed lastAnalysis after transport error (no stale attempt 1 data), got %+v", analysis)
+			t.Errorf("expected zeroed lastAnalysis after transport error, got %+v", analysis)
 		}
 	})
 
@@ -1505,12 +1687,12 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 		}
 	})
 
-	t.Run("first scrape retries up to memorySoakFirstScrapeMaxAttempts", func(t *testing.T) {
+	t.Run("first scrape retries transient transport errors up to memorySoakFirstScrapeMaxAttempts", func(t *testing.T) {
 		var attempts int
 		scrapeFn := func(_ context.Context) ([]byte, error) {
 			attempts++
 			if attempts < memorySoakFirstScrapeMaxAttempts {
-				return partialPayload, nil
+				return nil, errors.New("konnectivity proxy tunnel EOF")
 			}
 			return fullPayload, nil
 		}
@@ -1900,6 +2082,58 @@ func TestRetryTransientK8sAPICall(t *testing.T) {
 		}
 		if attempts != 1 {
 			t.Errorf("expected 1 attempt for non-transient error, got %d", attempts)
+		}
+	})
+}
+
+func TestFindAndCheckCSIMetricsIncompleteLogs(t *testing.T) {
+	t.Parallel()
+
+	floor := time.Date(2026, 11, 17, 7, 3, 52, 0, time.UTC)
+
+	t.Run("ignores benign CSI driver logs and pre-floor timestamps", func(t *testing.T) {
+		t.Parallel()
+		benignLogs := strings.Join([]string{
+			// Pre-floor mount-storm scrape error before warmup finished (must be filtered out):
+			`2026-11-17T07:01:10.123456789Z E1117 07:01:10.123400 1 metrics.go:759] failed to scrape metrics: dial unix /tmp/socket: connect: no such file or directory`,
+			// Benign high-rate dev tag warning & collector registration logs after floor:
+			`2026-11-17T07:03:55.000000001Z W1117 07:03:55.000000 1 util.go:632] Image tag 000.000 is not a valid semver, sidecarMinSupportedVersion check skipped.`,
+			`2026-11-17T07:03:56.000000001Z I1117 07:03:56.000000 1 metrics.go:577] successfully registered a metrics collector for mount path "/var/lib/kubelet/pods/1"`,
+		}, "\n")
+
+		if got := findCSIMetricsIncompleteLogs(benignLogs, floor); len(got) != 0 {
+			t.Fatalf("expected 0 incomplete-scrape log matches, got %v", got)
+		}
+	})
+
+	t.Run("detects all pkg/metrics incomplete-scrape warning and error signatures", func(t *testing.T) {
+		t.Parallel()
+		signatures := []string{
+			`2026-11-17T07:04:01.100000000Z W1117 07:04:01.100000 1 metrics.go:258] sequential metrics budget 30s exhausted while waiting for another metrics request to finish`,
+			`2026-11-17T07:04:02.100000000Z W1117 07:04:02.100000 1 metrics.go:315] sequential metrics budget 30s exhausted, skipping metrics of 1 out of 80 mounts`,
+			`2026-11-17T07:04:03.100000000Z E1117 07:04:03.100000 1 metrics.go:706] failed to encode metric family "volume_fs_ops_count": write tcp: broken pipe`,
+			`2026-11-17T07:04:04.100000000Z E1117 07:04:04.100000 1 metrics.go:751] failed to create scrape metrics request: invalid URL`,
+			`2026-11-17T07:04:05.100000000Z E1117 07:04:05.100000 1 metrics.go:759] failed to scrape metrics: context deadline exceeded`,
+			`2026-11-17T07:04:06.100000000Z E1117 07:04:06.100000 1 metrics.go:766] unexpected HTTP status: 503 Service Unavailable`,
+			`2026-11-17T07:04:07.100000000Z E1117 07:04:07.100000 1 metrics.go:780] failed to decode metrics data, dropping the remaining metrics of pod soak-ns/pod-80 volume "gcsfuse-vol": unexpected EOF`,
+			`2026-11-17T07:04:08.100000000Z E1117 07:04:08.100000 1 metrics.go:810] failed to process metrics data, dropping metrics of pod soak-ns/pod-80 volume "gcsfuse-vol": unexpected EOF`,
+		}
+
+		got := findCSIMetricsIncompleteLogs(strings.Join(signatures, "\n"), floor)
+		if len(got) != len(signatures) {
+			t.Fatalf("got %d matches, want %d: %v", len(got), len(signatures), got)
+		}
+	})
+
+	t.Run("checkCSIMetricsIncompleteLogs succeeds cleanly on fake clientset", func(t *testing.T) {
+		t.Parallel()
+		client := fake.NewSimpleClientset()
+		got, err := checkCSIMetricsIncompleteLogs(context.Background(), client, "gcs-fuse-csi-driver", "gcsfusecsi-node-abcde", floor.Add(10*time.Second), floor)
+		if err != nil {
+			t.Fatalf("unexpected error from fake clientset GetLogs: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("expected 0 matches on fake logs, got %v", got)
 		}
 	})
 }
