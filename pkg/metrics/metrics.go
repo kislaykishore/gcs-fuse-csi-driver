@@ -255,6 +255,7 @@ func (mm *manager) sequentialMetricsHandler(w http.ResponseWriter, r *http.Reque
 	releaseSlot := mm.acquireSequentialScrapeSlot(ctx)
 	if releaseSlot == nil {
 		if r.Context().Err() == nil {
+			// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 			klog.Warningf("sequential metrics budget %v exhausted while waiting for another metrics request to finish", budget)
 			http.Error(w, "timed out waiting for another metrics request to finish", http.StatusServiceUnavailable)
 		}
@@ -312,6 +313,7 @@ func (mm *manager) encodeCollectorsSequentially(ctx, reqCtx context.Context, fe 
 				skipped++
 			}
 			if skipped > 0 {
+				// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 				klog.Warningf("sequential metrics budget %v exhausted, skipping metrics of %d out of %d mounts", budget, skipped, n)
 			}
 			return
@@ -703,6 +705,7 @@ func (c *metricsCollector) encodeMetricFamilies(ctx context.Context, timeout tim
 			return true
 		}
 		if err := fe.encode(mf); err != nil {
+			// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 			klog.Errorf("failed to encode metric family %q: %v", mf.GetName(), err)
 			encodeErr = err
 			return false
@@ -748,6 +751,7 @@ func (c *metricsCollector) scrapeMetricFamilies(parentCtx context.Context, timeo
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, unixURL, nil)
 	if err != nil {
+		// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 		klog.Errorf("failed to create scrape metrics request: %v", err)
 
 		return false
@@ -756,6 +760,7 @@ func (c *metricsCollector) scrapeMetricFamilies(parentCtx context.Context, timeo
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
+		// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 		klog.Errorf("failed to scrape metrics: %v", err)
 
 		return false
@@ -763,6 +768,7 @@ func (c *metricsCollector) scrapeMetricFamilies(parentCtx context.Context, timeo
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 		klog.Errorf("unexpected HTTP status: %v", resp.Status)
 
 		return false
@@ -777,6 +783,7 @@ func (c *metricsCollector) scrapeMetricFamilies(parentCtx context.Context, timeo
 		seenFamilies := map[string]dto.MetricType{}
 		for mf, err := range decodeMetricFamilies(resp.Body) {
 			if err != nil {
+				// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 				klog.Errorf("failed to decode metrics data, dropping the remaining metrics of pod %v/%v volume %q: %v", c.namespace, c.podName, c.volumeName, err)
 
 				return false
@@ -807,6 +814,7 @@ func (c *metricsCollector) scrapeMetricFamilies(parentCtx context.Context, timeo
 		families, err = ProcessMetricsData(resp.Body)
 	}
 	if err != nil {
+		// NOTE: Matched by csiMetricsIncompleteLogPatterns in test/e2e/testsuites/memory_soak.go; keep in sync.
 		klog.Errorf("failed to process metrics data, dropping metrics of pod %v/%v volume %q: %v", c.namespace, c.podName, c.volumeName, err)
 
 		return false

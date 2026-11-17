@@ -78,13 +78,17 @@ const (
 	memorySoakSeedFileCount = 5
 	memorySoakSeedFileBytes = 1 << 20 // 1 MiB
 
-	memorySoakRolloutTimeout  = 5 * time.Minute
-	memorySoakPodReadyTimeout = 15 * time.Minute
-	memorySoakCleanupTimeout  = 3 * time.Minute
-	memorySoakDefaultWarmup   = 2 * time.Minute
-	memorySoakScrapeTimeout   = 60 * time.Second
-	memorySoakDiagTimeout     = 30 * time.Second
-	memorySoakLogTailLines    = int64(2000)
+	memorySoakRolloutTimeout       = 5 * time.Minute
+	memorySoakPodReadyTimeout      = 15 * time.Minute
+	memorySoakCleanupTimeout       = 3 * time.Minute
+	memorySoakDefaultWarmup        = 2 * time.Minute
+	memorySoakScrapeTimeout        = 60 * time.Second
+	memorySoakDiagTimeout          = 30 * time.Second
+	memorySoakLogTailLines         = int64(2000)
+	memorySoakStartupLogLimitBytes = int64(256 * 1024)
+
+	// Matches cmd/csi_driver/main.go warning emitted when memlimit.SetGoMemLimitWithOpts fails.
+	csiAutomemlimitFailureLogPattern = "Failed to automatically set GOMEMLIMIT"
 
 	memorySoakFirstScrapeMaxAttempts  = 4
 	memorySoakSteadyScrapeMaxAttempts = 3
@@ -146,20 +150,22 @@ type memorySoakScrapeAnalysis struct {
 	ScannerErr         string
 	IncompletePods     []string
 	MissingGRPCPods    []string
+	Attempt            int
+	AttemptStart       time.Time
 }
 
 // csiMetricsIncompleteLogPatterns matches pkg/metrics/metrics.go warning/error lines emitted when a
 // :9920/metrics scrape exhausts its sequential budget, skips mounts, fails to scrape/decode/process a
-// sidecar's metrics, or fails to encode a metric family.
+// sidecar's metrics, or fails to encode a metric family. Keep in sync with pkg/metrics/metrics.go.
 var csiMetricsIncompleteLogPatterns = []string{
-	"sequential metrics budget ",
-	"skipping metrics of ",
-	"failed to encode metric family ",
-	"failed to create scrape metrics request:",
-	"failed to scrape metrics:",
-	"unexpected HTTP status:",
-	"dropping the remaining metrics of pod ",
-	"dropping metrics of pod ",
+	"sequential metrics budget ",               // manager.sequentialMetricsHandler & manager.encodeCollectorsSequentially (pkg/metrics/metrics.go)
+	"skipping metrics of ",                     // manager.encodeCollectorsSequentially (pkg/metrics/metrics.go)
+	"failed to encode metric family ",          // metricsCollector.encodeMetricFamilies (pkg/metrics/metrics.go)
+	"failed to create scrape metrics request:", // metricsCollector.scrapeMetricFamilies (pkg/metrics/metrics.go)
+	"failed to scrape metrics:",                // metricsCollector.scrapeMetricFamilies (pkg/metrics/metrics.go)
+	"unexpected HTTP status:",                  // metricsCollector.scrapeMetricFamilies (pkg/metrics/metrics.go)
+	"dropping the remaining metrics of pod ",   // metricsCollector.scrapeMetricFamilies streaming decode (pkg/metrics/metrics.go)
+	"dropping metrics of pod ",                 // metricsCollector.scrapeMetricFamilies buffered decode (pkg/metrics/metrics.go)
 }
 
 type memorySoakSample struct {
@@ -209,6 +215,8 @@ type memorySoakSummary struct {
 	FinalCSIContainer     *memorySoakCSIContainerSummary `json:"finalCSIContainer,omitempty"`
 	Samples               []memorySoakSample             `json:"samples"`
 	DiagnosticWriteErrors []string                       `json:"diagnosticWriteErrors,omitempty"`
+
+	startupCSILogs string
 }
 
 type kubeletStatsSummary struct {
@@ -351,6 +359,17 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 		framework.Logf("Baseline CSI pod %s/%s UID=%s restartCount=%d effectiveMemoryLimit=%s",
 			csiNamespace, csiPod.Name, initialPodUID, initialRestartCount, effectiveLimit)
 
+		if startupLogs, startupLogErr := captureCSIStartupLogs(ctx, client, csiNamespace, csiPod.Name); startupLogErr != nil {
+			framework.Logf("Warning: failed to capture initial CSI driver startup logs from %s/%s: %v",
+				csiNamespace, csiPod.Name, startupLogErr)
+		} else {
+			summary.startupCSILogs = startupLogs
+			if effectiveLimit != "unlimited" && hasAutomemlimitFailureLog(startupLogs) {
+				framework.Failf("CSI driver %s/%s failed to configure automatic GOMEMLIMIT despite memory limit %s",
+					csiNamespace, csiPod.Name, effectiveLimit)
+			}
+		}
+
 		ginkgo.By("Preparing test GCS bucket, Workload Identity, and 5x 1 MiB seed files")
 		framework.ExpectNoError(ctx.Err(), "context cancelled before preparing test resources")
 		// PrepareTest closes over the passed context in its own DeferCleanup for bucket and
@@ -409,7 +428,7 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 
 		soakStart := time.Now()
 		soakEnd := soakStart.Add(MemorySoakDuration)
-		scrapeLogFloor := soakStart.Add(-5 * time.Second)
+		scrapeLogFloor := soakStart.Add(-2 * time.Second)
 		if scrapeLogFloor.Before(warmupStart) {
 			scrapeLogFloor = warmupStart
 		}
@@ -485,25 +504,24 @@ func (t *gcsFuseCSIMemorySoakTestSuite) DefineTests(driver storageframework.Test
 				framework.Failf("[sample %d] %s/%s:9920/metrics full scrape check failed: %v",
 					sampleIdx, csiNamespace, liveCSIPod.Name, fullScrapeErr)
 			}
-			logFetchTime := time.Now()
-			incompleteLogLines, logErr := checkCSIMetricsIncompleteLogs(
+			incompleteLogLines, nextLogCheckSince, nextHasUnverified, logErr := verifySampleCSIMetricsLogs(
 				ctx,
 				client,
 				csiNamespace,
 				liveCSIPod.Name,
+				iterStart,
+				scrapeAnalysis,
 				metricsLogCheckSince,
 				scrapeLogFloor,
+				hasUnverifiedMetricsLogWindow,
 			)
+			metricsLogCheckSince = nextLogCheckSince
+			hasUnverifiedMetricsLogWindow = nextHasUnverified
 			if logErr != nil {
-				hasUnverifiedMetricsLogWindow = true
 				framework.Logf("[sample %d] Warning: failed to inspect CSI driver logs for incomplete metrics scrapes: %v", sampleIdx, logErr)
-			} else {
-				hasUnverifiedMetricsLogWindow = false
-				metricsLogCheckSince = logFetchTime
-				if len(incompleteLogLines) > 0 {
-					framework.Failf("[sample %d] CSI driver %s/%s logged incomplete metrics scrape: %s",
-						sampleIdx, csiNamespace, liveCSIPod.Name, strings.Join(truncateStrings(incompleteLogLines, 5), "; "))
-				}
+			} else if len(incompleteLogLines) > 0 {
+				framework.Failf("[sample %d] CSI driver %s/%s logged incomplete metrics scrape: %s",
+					sampleIdx, csiNamespace, liveCSIPod.Name, strings.Join(truncateStrings(incompleteLogLines, 5), "; "))
 			}
 
 			// 5. Verify all workload pods remain Running and Ready on targetNode.
@@ -2108,9 +2126,12 @@ func scrapeAndAnalyzeCSIMetricsWithFunc(
 		if ctx.Err() != nil {
 			return lastBody, lastDur, lastAnalysis, ctx.Err()
 		}
-		lastAnalysis = memorySoakScrapeAnalysis{}
 		scrapeCtx, cancel := context.WithTimeout(ctx, memorySoakScrapeTimeout)
 		start := time.Now()
+		lastAnalysis = memorySoakScrapeAnalysis{
+			Attempt:      attempt,
+			AttemptStart: start,
+		}
 		body, err := scrapeFn(scrapeCtx)
 		dur := time.Since(start)
 		cancel()
@@ -2123,6 +2144,8 @@ func scrapeAndAnalyzeCSIMetricsWithFunc(
 			// scrapes fail Step 4 instead of being masked by retry attempts. Retries apply strictly
 			// to transient K8s API / Konnectivity proxy transport errors (err != nil).
 			lastAnalysis = analyzeScrapePayload(body, workloadNamespace, expectedPods)
+			lastAnalysis.Attempt = attempt
+			lastAnalysis.AttemptStart = start
 			return lastBody, lastDur, lastAnalysis, nil
 		}
 
@@ -2156,34 +2179,178 @@ func scrapeAndAnalyzeCSIMetricsWithFunc(
 	return lastBody, lastDur, lastAnalysis, lastErr
 }
 
+type csiMetricsLogFetchFunc func(ctx context.Context, querySince time.Time) (string, error)
+
+func captureCSIStartupLogs(ctx context.Context, client clientset.Interface, csiNamespace, csiPodName string) (string, error) {
+	rawLogs, err := retryTransientK8sAPICall(ctx, "capture CSI driver startup logs", func(callCtx context.Context) ([]byte, error) {
+		return client.CoreV1().Pods(csiNamespace).GetLogs(csiPodName, &corev1.PodLogOptions{
+			Container:  memorySoakCSIContainerName,
+			LimitBytes: ptr.To(memorySoakStartupLogLimitBytes),
+		}).DoRaw(callCtx)
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(rawLogs), nil
+}
+
+func hasAutomemlimitFailureLog(startupLogs string) bool {
+	return strings.Contains(startupLogs, csiAutomemlimitFailureLogPattern)
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+func newCSIMetricsLogFetcher(client clientset.Interface, csiNamespace, csiPodName string) csiMetricsLogFetchFunc {
+	return func(ctx context.Context, querySince time.Time) (string, error) {
+		sinceMeta := metav1.NewTime(querySince)
+		rawLogs, err := retryTransientK8sAPICall(ctx, "fetch CSI driver metrics logs", func(callCtx context.Context) ([]byte, error) {
+			return client.CoreV1().Pods(csiNamespace).GetLogs(csiPodName, &corev1.PodLogOptions{
+				Container:  memorySoakCSIContainerName,
+				SinceTime:  &sinceMeta,
+				Timestamps: true,
+			}).DoRaw(callCtx)
+		})
+		if err != nil {
+			return "", err
+		}
+		return string(rawLogs), nil
+	}
+}
+
+func computeCSIMetricsLogQuerySince(since, notBefore time.Time) time.Time {
+	querySince := since.Add(-2 * time.Second).Truncate(time.Second)
+	floor := notBefore.Truncate(time.Second)
+	if !notBefore.IsZero() && querySince.Before(floor) {
+		querySince = floor
+	}
+	return querySince
+}
+
+func checkCSIMetricsIncompleteLogsWindowWithFunc(
+	ctx context.Context,
+	fetchLogs csiMetricsLogFetchFunc,
+	since, notBefore, before time.Time,
+) ([]string, error) {
+	effectiveNotBefore := notBefore
+	if !since.IsZero() {
+		effectiveNotBefore = maxTime(notBefore, since.Add(-2*time.Second))
+	}
+	querySince := computeCSIMetricsLogQuerySince(since, effectiveNotBefore)
+	rawLogs, err := fetchLogs(ctx, querySince)
+	if err != nil {
+		return nil, err
+	}
+	return findCSIMetricsIncompleteLogsWindow(rawLogs, effectiveNotBefore, before), nil
+}
+
+func verifySampleCSIMetricsLogs(
+	ctx context.Context,
+	client clientset.Interface,
+	csiNamespace, csiPodName string,
+	iterStart time.Time,
+	scrapeAnalysis memorySoakScrapeAnalysis,
+	metricsLogCheckSince, scrapeLogFloor time.Time,
+	hasUnverifiedMetricsLogWindow bool,
+) ([]string, time.Time, bool, error) {
+	return verifySampleCSIMetricsLogsWithFunc(
+		ctx,
+		newCSIMetricsLogFetcher(client, csiNamespace, csiPodName),
+		time.Now,
+		iterStart,
+		scrapeAnalysis,
+		metricsLogCheckSince,
+		scrapeLogFloor,
+		hasUnverifiedMetricsLogWindow,
+	)
+}
+
+func verifySampleCSIMetricsLogsWithFunc(
+	ctx context.Context,
+	fetchLogs csiMetricsLogFetchFunc,
+	nowFn func() time.Time,
+	iterStart time.Time,
+	scrapeAnalysis memorySoakScrapeAnalysis,
+	metricsLogCheckSince, scrapeLogFloor time.Time,
+	hasUnverifiedMetricsLogWindow bool,
+) (incompleteLines []string, nextLogCheckSince time.Time, nextHasUnverified bool, err error) {
+	if scrapeAnalysis.Attempt <= 1 {
+		logFetchTime := nowFn()
+		lines, logErr := checkCSIMetricsIncompleteLogsWindowWithFunc(
+			ctx,
+			fetchLogs,
+			metricsLogCheckSince,
+			scrapeLogFloor,
+			time.Time{},
+		)
+		if logErr != nil {
+			return nil, metricsLogCheckSince, true, logErr
+		}
+		return lines, logFetchTime, false, nil
+	}
+
+	// scrapeAnalysis.Attempt > 1: Attempts 1..Attempt-1 failed strictly with transport errors
+	// (err != nil) and passed csiHealthCheck, so transient proxy/Konnectivity disconnects during
+	// those failed attempts may have emitted broken-pipe or slot-wait logs on the CSI driver.
+	if hasUnverifiedMetricsLogWindow {
+		priorLines, priorErr := checkCSIMetricsIncompleteLogsWindowWithFunc(
+			ctx,
+			fetchLogs,
+			metricsLogCheckSince,
+			scrapeLogFloor,
+			iterStart,
+		)
+		if priorErr != nil {
+			return nil, metricsLogCheckSince, true, priorErr
+		}
+		if len(priorLines) > 0 {
+			return priorLines, metricsLogCheckSince, false, nil
+		}
+	}
+
+	winningSince := scrapeAnalysis.AttemptStart
+	if winningSince.IsZero() {
+		winningSince = iterStart
+	}
+	winningNotBefore := maxTime(scrapeLogFloor, winningSince.Add(-2*time.Second))
+	logFetchTime := nowFn()
+	winningLines, winningErr := checkCSIMetricsIncompleteLogsWindowWithFunc(
+		ctx,
+		fetchLogs,
+		winningSince,
+		winningNotBefore,
+		time.Time{},
+	)
+	if winningErr != nil {
+		return nil, maxTime(metricsLogCheckSince, winningSince), true, winningErr
+	}
+	return winningLines, logFetchTime, false, nil
+}
+
 func checkCSIMetricsIncompleteLogs(
 	ctx context.Context,
 	client clientset.Interface,
 	csiNamespace, csiPodName string,
 	since, notBefore time.Time,
 ) ([]string, error) {
-	querySince := since.Add(-2 * time.Second).Truncate(time.Second)
-	floor := notBefore.Truncate(time.Second)
-	if !notBefore.IsZero() && querySince.Before(floor) {
-		querySince = floor
-	}
-	sinceMeta := metav1.NewTime(querySince)
-	rawLogs, err := retryTransientK8sAPICall(ctx, "fetch CSI driver metrics logs", func(callCtx context.Context) ([]byte, error) {
-		logCtx, cancel := context.WithTimeout(callCtx, memorySoakDiagTimeout)
-		defer cancel()
-		return client.CoreV1().Pods(csiNamespace).GetLogs(csiPodName, &corev1.PodLogOptions{
-			Container:  memorySoakCSIContainerName,
-			SinceTime:  &sinceMeta,
-			Timestamps: true,
-		}).DoRaw(logCtx)
-	})
-	if err != nil {
-		return nil, err
-	}
-	return findCSIMetricsIncompleteLogs(string(rawLogs), notBefore), nil
+	return checkCSIMetricsIncompleteLogsWindowWithFunc(
+		ctx,
+		newCSIMetricsLogFetcher(client, csiNamespace, csiPodName),
+		since,
+		notBefore,
+		time.Time{},
+	)
 }
 
 func findCSIMetricsIncompleteLogs(logText string, notBefore time.Time) []string {
+	return findCSIMetricsIncompleteLogsWindow(logText, notBefore, time.Time{})
+}
+
+func findCSIMetricsIncompleteLogsWindow(logText string, notBefore, before time.Time) []string {
 	if logText == "" {
 		return nil
 	}
@@ -2196,12 +2363,18 @@ func findCSIMetricsIncompleteLogs(logText string, notBefore time.Time) []string 
 			continue
 		}
 		// When PodLogOptions{Timestamps: true} is used, kubelet prefixes each line with an RFC3339Nano
-		// timestamp (e.g. "2026-11-17T07:03:52.812345678Z E1117 ..."). Filter out lines strictly before
-		// notBefore so <=1s SinceTime truncation never matches pre-soak warmup logs.
-		if !notBefore.IsZero() {
+		// timestamp (e.g. "2026-11-17T07:03:52.812345678Z E1117 ..."). Filter out lines outside
+		// [notBefore, before) so <=1s SinceTime truncation never matches pre-soak warmup logs or
+		// superseded transport-retry windows.
+		if !notBefore.IsZero() || !before.IsZero() {
 			if sep := strings.IndexByte(line, ' '); sep > 0 {
-				if ts, err := time.Parse(time.RFC3339Nano, line[:sep]); err == nil && ts.Before(notBefore) {
-					continue
+				if ts, err := time.Parse(time.RFC3339Nano, line[:sep]); err == nil {
+					if !notBefore.IsZero() && ts.Before(notBefore) {
+						continue
+					}
+					if !before.IsZero() && !ts.Before(before) {
+						continue
+					}
 				}
 			}
 		}
@@ -2269,6 +2442,7 @@ func writeSoakDiagnostics(ctx context.Context, client clientset.Interface, artif
 
 	summary.EndTime = time.Now().UTC().Format(time.RFC3339)
 
+	startupPodName := summary.CSIPodName
 	var currentPodName string
 	var needPreviousLogs bool
 	if summary.CSINamespace != "" && summary.TargetNode != "" {
@@ -2302,19 +2476,33 @@ func writeSoakDiagnostics(ctx context.Context, client clientset.Interface, artif
 		currentPodName = summary.CSIPodName
 		needPreviousLogs = summary.Status != "passed"
 	}
+	if startupPodName == "" {
+		startupPodName = currentPodName
+	}
 
 	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
 		framework.Logf("Failed to create artifacts directory %q: %v", artifactsDir, err)
 		return
 	}
 
+	var logBuf bytes.Buffer
+	if summary.startupCSILogs != "" && summary.CSINamespace != "" && startupPodName != "" {
+		logBuf.WriteString(fmt.Sprintf("=== STARTUP LOGS (%s/%s container=%s) ===\n", summary.CSINamespace, startupPodName, memorySoakCSIContainerName))
+		logBuf.WriteString(summary.startupCSILogs)
+		if !strings.HasSuffix(summary.startupCSILogs, "\n") {
+			logBuf.WriteByte('\n')
+		}
+	}
+
 	if currentPodName != "" {
-		var logBuf bytes.Buffer
 		tailLines := memorySoakLogTailLines
 		if logs, err := client.CoreV1().Pods(summary.CSINamespace).GetLogs(currentPodName, &corev1.PodLogOptions{
 			Container: memorySoakCSIContainerName,
 			TailLines: &tailLines,
 		}).DoRaw(diagCtx); err == nil {
+			if logBuf.Len() > 0 {
+				logBuf.WriteByte('\n')
+			}
 			logBuf.WriteString(fmt.Sprintf("=== CURRENT LOGS (%s/%s container=%s) ===\n", summary.CSINamespace, currentPodName, memorySoakCSIContainerName))
 			logBuf.Write(logs)
 			logBuf.WriteByte('\n')
@@ -2333,15 +2521,15 @@ func writeSoakDiagnostics(ctx context.Context, client clientset.Interface, artif
 				logBuf.WriteByte('\n')
 			}
 		}
+	}
 
-		if logBuf.Len() > 0 {
-			logPath := filepath.Join(artifactsDir, "csi_driver_logs.txt")
-			//nolint:gosec // G306: $ARTIFACTS files must be readable by non-root Prow sidecar uploader.
-			if err := os.WriteFile(logPath, logBuf.Bytes(), 0o644); err != nil {
-				summary.DiagnosticWriteErrors = append(summary.DiagnosticWriteErrors, fmt.Sprintf("write %s: %v", logPath, err))
-			} else {
-				framework.Logf("Wrote CSI driver logs to %s (%d bytes)", logPath, logBuf.Len())
-			}
+	if logBuf.Len() > 0 {
+		logPath := filepath.Join(artifactsDir, "csi_driver_logs.txt")
+		//nolint:gosec // G306: $ARTIFACTS files must be readable by non-root Prow sidecar uploader.
+		if err := os.WriteFile(logPath, logBuf.Bytes(), 0o644); err != nil {
+			summary.DiagnosticWriteErrors = append(summary.DiagnosticWriteErrors, fmt.Sprintf("write %s: %v", logPath, err))
+		} else {
+			framework.Logf("Wrote CSI driver logs to %s (%d bytes)", logPath, logBuf.Len())
 		}
 	}
 

@@ -1496,6 +1496,71 @@ func TestWriteSoakDiagnostics(t *testing.T) {
 		}
 	})
 
+	t.Run("emits STARTUP LOGS before CURRENT LOGS and conditional PREVIOUS LOGS", func(t *testing.T) {
+		t.Parallel()
+		now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+		pod := makeTestCSIPod("gcs-fuse-csi-driver", "gcsfusecsi-node-startup", "node-a", "uid-startup", corev1.PodRunning, now, "50Mi", true, 0)
+		client := fake.NewSimpleClientset(pod)
+
+		passedDir := t.TempDir()
+		passedSummary := &memorySoakSummary{
+			Status:         "passed",
+			CSINamespace:   "gcs-fuse-csi-driver",
+			TargetNode:     "node-a",
+			CSIPodName:     "gcsfusecsi-node-startup",
+			startupCSILogs: "I1117 07:00:01.000000 1 main.go:128] GOMEMLIMIT=45MiB\n",
+		}
+		writeSoakDiagnostics(ctx, client, passedDir, passedSummary)
+
+		logBytes, err := os.ReadFile(filepath.Join(passedDir, "csi_driver_logs.txt"))
+		if err != nil {
+			t.Fatalf("failed to read csi_driver_logs.txt: %v", err)
+		}
+		logText := string(logBytes)
+		startupIdx := strings.Index(logText, "=== STARTUP LOGS (gcs-fuse-csi-driver/gcsfusecsi-node-startup container=gcs-fuse-csi-driver) ===")
+		currentIdx := strings.Index(logText, "=== CURRENT LOGS (gcs-fuse-csi-driver/gcsfusecsi-node-startup container=gcs-fuse-csi-driver) ===")
+		if startupIdx < 0 || currentIdx < 0 || startupIdx >= currentIdx {
+			t.Fatalf("expected STARTUP LOGS before CURRENT LOGS, got startupIdx=%d currentIdx=%d in:\n%s", startupIdx, currentIdx, logText)
+		}
+		if !strings.Contains(logText, "GOMEMLIMIT=45MiB") {
+			t.Errorf("expected startup log content in csi_driver_logs.txt, got:\n%s", logText)
+		}
+		if strings.Contains(logText, "=== PREVIOUS LOGS") {
+			t.Errorf("unexpected PREVIOUS LOGS header when passed with 0 restarts:\n%s", logText)
+		}
+
+		summaryBytes, err := os.ReadFile(filepath.Join(passedDir, "memory_soak_summary.json"))
+		if err != nil {
+			t.Fatalf("failed to read memory_soak_summary.json: %v", err)
+		}
+		if strings.Contains(string(summaryBytes), "GOMEMLIMIT=45MiB") {
+			t.Errorf("unexported startupCSILogs must not leak into memory_soak_summary.json: %s", string(summaryBytes))
+		}
+
+		failedDir := t.TempDir()
+		failedSummary := &memorySoakSummary{
+			Status:         "failed",
+			CSINamespace:   "gcs-fuse-csi-driver",
+			TargetNode:     "node-a",
+			CSIPodName:     "gcsfusecsi-node-startup",
+			startupCSILogs: "W1117 07:00:01.000000 1 main.go:134] Failed to automatically set GOMEMLIMIT: cgroup is not supported",
+		}
+		writeSoakDiagnostics(ctx, client, failedDir, failedSummary)
+
+		failedLogBytes, err := os.ReadFile(filepath.Join(failedDir, "csi_driver_logs.txt"))
+		if err != nil {
+			t.Fatalf("failed to read failed csi_driver_logs.txt: %v", err)
+		}
+		failedLogText := string(failedLogBytes)
+		fStartupIdx := strings.Index(failedLogText, "=== STARTUP LOGS (gcs-fuse-csi-driver/gcsfusecsi-node-startup container=gcs-fuse-csi-driver) ===")
+		fCurrentIdx := strings.Index(failedLogText, "=== CURRENT LOGS (gcs-fuse-csi-driver/gcsfusecsi-node-startup container=gcs-fuse-csi-driver) ===")
+		fPrevIdx := strings.Index(failedLogText, "=== PREVIOUS LOGS (gcs-fuse-csi-driver/gcsfusecsi-node-startup container=gcs-fuse-csi-driver) ===")
+		if fStartupIdx < 0 || fCurrentIdx < 0 || fPrevIdx < 0 || !(fStartupIdx < fCurrentIdx && fCurrentIdx < fPrevIdx) {
+			t.Fatalf("expected STARTUP LOGS < CURRENT LOGS < PREVIOUS LOGS on failed run, got (%d, %d, %d) in:\n%s",
+				fStartupIdx, fCurrentIdx, fPrevIdx, failedLogText)
+		}
+	})
+
 	t.Run("writes diagnostic artifacts with non-owner read permissions modulo process umask", func(t *testing.T) {
 		t.Parallel()
 		now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
@@ -1593,6 +1658,9 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 		if len(body) == 0 || analysis.DistinctPods != 2 {
 			t.Errorf("unexpected scrape result: bytes=%d analysis=%+v", len(body), analysis)
 		}
+		if analysis.Attempt != 2 || analysis.AttemptStart.IsZero() {
+			t.Errorf("got Attempt=%d AttemptStart=%v, want Attempt=2 and non-zero AttemptStart", analysis.Attempt, analysis.AttemptStart)
+		}
 	})
 
 	t.Run("does not retry partial or empty HTTP 200 payload", func(t *testing.T) {
@@ -1619,6 +1687,9 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 			}
 			if analysis.DistinctPods != 1 {
 				t.Errorf("isFirst=%v: got DistinctPods=%d, want 1", isFirst, analysis.DistinctPods)
+			}
+			if analysis.Attempt != 1 || analysis.AttemptStart.IsZero() {
+				t.Errorf("isFirst=%v: got Attempt=%d AttemptStart=%v, want Attempt=1 and non-zero AttemptStart", isFirst, analysis.Attempt, analysis.AttemptStart)
 			}
 			if fullErr := validateFullScrapeResult(body, analysis, len(expectedPods), "soak-ns", false); fullErr == nil {
 				t.Errorf("isFirst=%v: expected validateFullScrapeResult to reject partial HTTP 200 scrape", isFirst)
@@ -1662,6 +1733,10 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 		}
 		if analysis.Bytes != 0 || analysis.SeriesCount != 0 || analysis.DistinctPods != 0 || len(analysis.MissingPods) != 0 {
 			t.Errorf("expected zeroed lastAnalysis after transport error, got %+v", analysis)
+		}
+		if analysis.Attempt != memorySoakSteadyScrapeMaxAttempts || analysis.AttemptStart.IsZero() {
+			t.Errorf("got Attempt=%d AttemptStart=%v, want Attempt=%d and non-zero AttemptStart",
+				analysis.Attempt, analysis.AttemptStart, memorySoakSteadyScrapeMaxAttempts)
 		}
 	})
 
@@ -1708,6 +1783,10 @@ func TestScrapeAndAnalyzeCSIMetrics(t *testing.T) {
 		}
 		if analysis.DistinctPods != 2 {
 			t.Errorf("got DistinctPods=%d, want 2", analysis.DistinctPods)
+		}
+		if analysis.Attempt != memorySoakFirstScrapeMaxAttempts || analysis.AttemptStart.IsZero() {
+			t.Errorf("got Attempt=%d AttemptStart=%v, want Attempt=%d and non-zero AttemptStart",
+				analysis.Attempt, analysis.AttemptStart, memorySoakFirstScrapeMaxAttempts)
 		}
 	})
 
@@ -2134,6 +2213,279 @@ func TestFindAndCheckCSIMetricsIncompleteLogs(t *testing.T) {
 		}
 		if len(got) != 0 {
 			t.Errorf("expected 0 matches on fake logs, got %v", got)
+		}
+	})
+}
+
+func TestHasAutomemlimitFailureLogAndCaptureStartupLogs(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name string
+		logs string
+		want bool
+	}{
+		{
+			name: "empty startup logs",
+			logs: "",
+			want: false,
+		},
+		{
+			name: "healthy startup logs without automemlimit warning",
+			logs: strings.Join([]string{
+				`I1117 07:00:01.100000 1 main.go:181] Running cloud profiler on gcs-fuse-csi-driver`,
+				`I1117 07:00:01.200000 1 metrics.go:450] metric server listening at ":9920"`,
+			}, "\n"),
+			want: false,
+		},
+		{
+			name: "detects cmd/csi_driver/main.go automemlimit failure warning",
+			logs: strings.Join([]string{
+				`W1117 07:00:01.050000 1 main.go:134] Failed to automatically set GOMEMLIMIT: memory is not limited`,
+				`I1117 07:00:01.200000 1 metrics.go:450] metric server listening at ":9920"`,
+			}, "\n"),
+			want: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := hasAutomemlimitFailureLog(tc.logs); got != tc.want {
+				t.Errorf("hasAutomemlimitFailureLog() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+
+	t.Run("captureCSIStartupLogs succeeds on fake clientset", func(t *testing.T) {
+		t.Parallel()
+		client := fake.NewSimpleClientset()
+		logs, err := captureCSIStartupLogs(context.Background(), client, "gcs-fuse-csi-driver", "gcsfusecsi-node-abcde")
+		if err != nil {
+			t.Fatalf("captureCSIStartupLogs failed: %v", err)
+		}
+		if logs == "" {
+			t.Error("expected non-empty fake logs from captureCSIStartupLogs")
+		}
+	})
+}
+
+func TestVerifySampleCSIMetricsLogs(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	warmupStart := time.Date(2026, 11, 17, 7, 2, 0, 0, time.UTC)
+	soakStart := time.Date(2026, 11, 17, 7, 4, 0, 0, time.UTC)
+	scrapeLogFloor := soakStart.Add(-2 * time.Second)
+	if scrapeLogFloor.Before(warmupStart) {
+		scrapeLogFloor = warmupStart
+	}
+
+	t.Run("Attempt 1 Konnectivity broken-pipe followed by clean Attempt 2 passes Step 4 log gate", func(t *testing.T) {
+		t.Parallel()
+		iterStart := soakStart.Add(10 * time.Second)            // 07:04:10Z
+		attempt2Start := iterStart.Add(5500 * time.Millisecond) // 07:04:15.5Z (>= 5s retryDelay after Attempt 1)
+		fetchNow := attempt2Start.Add(600 * time.Millisecond)   // 07:04:16.1Z
+
+		containerLogs := strings.Join([]string{
+			// Late-warmup log 3s before soakStart (excluded by tightened -2s scrapeLogFloor = 07:03:58Z):
+			`2026-11-17T07:03:57.000000000Z E1117 07:03:57.000000 1 metrics.go:759] failed to scrape metrics: dial unix /tmp/socket: connect: no such file or directory`,
+			// Attempt 1 mid-stream Konnectivity broken pipe at 07:04:10.450Z (must be excluded when Attempt 2 wins):
+			`2026-11-17T07:04:10.450000000Z E1117 07:04:10.450000 1 metrics.go:706] failed to encode metric family "volume_fs_ops_count": write tcp: broken pipe`,
+			// Clean Attempt 2 benign logs:
+			`2026-11-17T07:04:15.800000000Z I1117 07:04:15.800000 1 metrics.go:584] successfully registered a new metrics collector for mount path "/var/lib/kubelet/pods/1"`,
+		}, "\n")
+
+		var fetchCalls int
+		fetchFn := func(_ context.Context, _ time.Time) (string, error) {
+			fetchCalls++
+			return containerLogs, nil
+		}
+
+		lines, nextSince, nextUnverified, err := verifySampleCSIMetricsLogsWithFunc(
+			ctx,
+			fetchFn,
+			func() time.Time { return fetchNow },
+			iterStart,
+			memorySoakScrapeAnalysis{
+				Bytes:        1024,
+				SeriesCount:  100,
+				DistinctPods: 80,
+				Attempt:      2,
+				AttemptStart: attempt2Start,
+			},
+			soakStart,
+			scrapeLogFloor,
+			false,
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lines) != 0 {
+			t.Fatalf("expected Attempt 1 broken-pipe log to be excluded when Attempt 2 succeeds cleanly, got: %v", lines)
+		}
+		if fetchCalls != 1 {
+			t.Errorf("got %d log fetch calls, want 1 when hasUnverifiedMetricsLogWindow is false", fetchCalls)
+		}
+		if nextUnverified {
+			t.Error("expected nextUnverified=false after successful check")
+		}
+		if !nextSince.Equal(fetchNow) {
+			t.Errorf("nextSince = %v, want %v", nextSince, fetchNow)
+		}
+	})
+
+	t.Run("incomplete-scrape log emitted during winning Attempt 2 (>= AttemptStart - 2s) fails Step 4", func(t *testing.T) {
+		t.Parallel()
+		iterStart := soakStart.Add(10 * time.Second)            // 07:04:10Z
+		attempt2Start := iterStart.Add(5500 * time.Millisecond) // 07:04:15.5Z -> notBefore = 07:04:13.5Z
+		fetchNow := attempt2Start.Add(800 * time.Millisecond)
+
+		for _, tc := range []struct {
+			name    string
+			logLine string
+		}{
+			{
+				name:    "emitted during Attempt 2",
+				logLine: `2026-11-17T07:04:15.700000000Z W1117 07:04:15.700000 1 metrics.go:315] sequential metrics budget 30s exhausted, skipping metrics of 2 out of 80 mounts`,
+			},
+			{
+				name:    "emitted within 2s clock-skew tolerance of Attempt 2 start",
+				logLine: `2026-11-17T07:04:14.000000000Z E1117 07:04:14.000000 1 metrics.go:759] failed to scrape metrics: context deadline exceeded`,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				containerLogs := strings.Join([]string{
+					`2026-11-17T07:04:10.450000000Z E1117 07:04:10.450000 1 metrics.go:706] failed to encode metric family "volume_fs_ops_count": write tcp: broken pipe`,
+					tc.logLine,
+				}, "\n")
+
+				lines, _, nextUnverified, err := verifySampleCSIMetricsLogsWithFunc(
+					ctx,
+					func(_ context.Context, _ time.Time) (string, error) { return containerLogs, nil },
+					func() time.Time { return fetchNow },
+					iterStart,
+					memorySoakScrapeAnalysis{
+						Attempt:      2,
+						AttemptStart: attempt2Start,
+					},
+					soakStart,
+					scrapeLogFloor,
+					false,
+				)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if nextUnverified {
+					t.Error("expected nextUnverified=false")
+				}
+				if len(lines) != 1 || lines[0] != tc.logLine {
+					t.Fatalf("got matched lines %v, want [%q]", lines, tc.logLine)
+				}
+			})
+		}
+	})
+
+	t.Run("earlier sample unverified log window (< iterStart) is still caught when next sample succeeds on Attempt 2", func(t *testing.T) {
+		t.Parallel()
+		sample1IterStart := soakStart
+		sample1FetchNow := soakStart.Add(500 * time.Millisecond)
+
+		// Sample 1 succeeds on Attempt 1, but GetLogs fails with transient 503.
+		_, sinceAfterS1, unverifiedAfterS1, s1Err := verifySampleCSIMetricsLogsWithFunc(
+			ctx,
+			func(_ context.Context, _ time.Time) (string, error) {
+				return "", apierrors.NewServiceUnavailable("apiserver temporarily unavailable")
+			},
+			func() time.Time { return sample1FetchNow },
+			sample1IterStart,
+			memorySoakScrapeAnalysis{Attempt: 1, AttemptStart: sample1IterStart},
+			soakStart,
+			scrapeLogFloor,
+			false,
+		)
+		if s1Err == nil || !unverifiedAfterS1 || !sinceAfterS1.Equal(soakStart) {
+			t.Fatalf("expected Sample 1 GetLogs error to preserve soakStart and set unverified=true, got err=%v unverified=%t since=%v",
+				s1Err, unverifiedAfterS1, sinceAfterS1)
+		}
+
+		// Sample 2 runs at 07:04:10Z, fails Attempt 1 with broken pipe, and succeeds on Attempt 2 at 07:04:15.5Z.
+		sample2IterStart := soakStart.Add(10 * time.Second)
+		sample2Attempt2Start := sample2IterStart.Add(5500 * time.Millisecond)
+		sample2FetchNow := sample2Attempt2Start.Add(500 * time.Millisecond)
+
+		priorSampleIncompleteLine := `2026-11-17T07:04:00.300000000Z E1117 07:04:00.300000 1 metrics.go:810] failed to process metrics data, dropping metrics of pod soak-ns/pod-1 volume "gcsfuse-vol": unexpected EOF`
+		attempt1BrokenPipeLine := `2026-11-17T07:04:10.400000000Z E1117 07:04:10.400000 1 metrics.go:706] failed to encode metric family "volume_fs_ops_count": write tcp: broken pipe`
+
+		linesWithPriorBug, _, _, s2Err := verifySampleCSIMetricsLogsWithFunc(
+			ctx,
+			func(_ context.Context, _ time.Time) (string, error) {
+				return strings.Join([]string{priorSampleIncompleteLine, attempt1BrokenPipeLine}, "\n"), nil
+			},
+			func() time.Time { return sample2FetchNow },
+			sample2IterStart,
+			memorySoakScrapeAnalysis{Attempt: 2, AttemptStart: sample2Attempt2Start},
+			sinceAfterS1,
+			scrapeLogFloor,
+			unverifiedAfterS1,
+		)
+		if s2Err != nil {
+			t.Fatalf("unexpected error on Sample 2: %v", s2Err)
+		}
+		if len(linesWithPriorBug) != 1 || linesWithPriorBug[0] != priorSampleIncompleteLine {
+			t.Fatalf("expected Sample 1 incomplete-scrape log (< iterStart) to be caught, got: %v", linesWithPriorBug)
+		}
+
+		// Conversely, if Sample 1's unverified window was clean and only Sample 2 Attempt 1 logged broken-pipe,
+		// Sample 2 verifies both [metricsLogCheckSince, iterStart) and Attempt 2 cleanly without false positive.
+		var cleanFetchCalls int
+		cleanLines, nextSince, nextUnverified, cleanErr := verifySampleCSIMetricsLogsWithFunc(
+			ctx,
+			func(_ context.Context, _ time.Time) (string, error) {
+				cleanFetchCalls++
+				return attempt1BrokenPipeLine, nil
+			},
+			func() time.Time { return sample2FetchNow },
+			sample2IterStart,
+			memorySoakScrapeAnalysis{Attempt: 2, AttemptStart: sample2Attempt2Start},
+			sinceAfterS1,
+			scrapeLogFloor,
+			unverifiedAfterS1,
+		)
+		if cleanErr != nil {
+			t.Fatalf("unexpected error on clean prior window: %v", cleanErr)
+		}
+		if len(cleanLines) != 0 {
+			t.Fatalf("expected 0 incomplete lines when prior window is clean and Attempt 2 wins, got: %v", cleanLines)
+		}
+		if cleanFetchCalls != 2 {
+			t.Errorf("got %d fetch calls, want 2 (prior unverified window + winning Attempt 2 window)", cleanFetchCalls)
+		}
+		if nextUnverified || !nextSince.Equal(sample2FetchNow) {
+			t.Errorf("got (nextUnverified=%t, nextSince=%v), want (false, %v)", nextUnverified, nextSince, sample2FetchNow)
+		}
+	})
+
+	t.Run("verifySampleCSIMetricsLogs succeeds cleanly on fake clientset", func(t *testing.T) {
+		t.Parallel()
+		client := fake.NewSimpleClientset()
+		lines, nextSince, nextUnverified, err := verifySampleCSIMetricsLogs(
+			ctx,
+			client,
+			"gcs-fuse-csi-driver",
+			"gcsfusecsi-node-abcde",
+			soakStart,
+			memorySoakScrapeAnalysis{Attempt: 1, AttemptStart: soakStart},
+			soakStart,
+			scrapeLogFloor,
+			false,
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(lines) != 0 || nextUnverified || nextSince.IsZero() {
+			t.Errorf("unexpected result: lines=%v nextUnverified=%t nextSince=%v", lines, nextUnverified, nextSince)
 		}
 	})
 }
