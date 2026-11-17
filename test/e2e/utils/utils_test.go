@@ -471,7 +471,7 @@ func TestValidateMemorySoakParameters(t *testing.T) {
 				SoakPodCount:         80,
 				SoakDuration:         "4h",
 				SoakScrapeInterval:   "60s",
-				CSIDriverMemoryLimit: "100Mi",
+				CSIDriverMemoryLimit: "50Mi",
 			},
 		},
 		{

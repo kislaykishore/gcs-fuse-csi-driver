@@ -126,7 +126,7 @@ var (
 	MemorySoakPodCount = 80
 	// MemorySoakCSIDriverMemoryLimit enforces the container memory limit on ds/gcsfusecsi-node
 	// (gcs-fuse-csi-driver container) for non-managed driver installs. Empty means leave unchanged.
-	MemorySoakCSIDriverMemoryLimit = "100Mi"
+	MemorySoakCSIDriverMemoryLimit = "50Mi"
 
 	// Package-level retry/settle durations so unit tests can override them without slow sleeps.
 	memorySoakRolloutSettleDuration  = 10 * time.Second

@@ -62,8 +62,8 @@ func TestValidateMemorySoakConfig(t *testing.T) {
 			duration:       4 * time.Hour,
 			scrapeInterval: 60 * time.Second,
 			podCount:       80,
-			memLimit:       "100Mi",
-			wantLimitBytes: 100 * 1024 * 1024,
+			memLimit:       MemorySoakCSIDriverMemoryLimit,
+			wantLimitBytes: 50 * 1024 * 1024,
 		},
 		{
 			name:           "valid empty memory limit disables override",
