@@ -302,7 +302,7 @@ func TestApplyMemorySoakDefaults(t *testing.T) {
 				GinkgoTimeout:       "4h",
 				NumNodes:            9,
 				NodeMachineType:     "n2-standard-8",
-				SoakDuration:        "4h",
+				SoakDuration:        "30m",
 			}
 			ApplyMemorySoakDefaults(params, map[string]bool{})
 
@@ -321,8 +321,8 @@ func TestApplyMemorySoakDefaults(t *testing.T) {
 			if params.NodeMachineType != "n2-standard-32" {
 				t.Errorf("NodeMachineType = %q, want n2-standard-32", params.NodeMachineType)
 			}
-			if params.GinkgoTimeout != "5h" {
-				t.Errorf("GinkgoTimeout = %q, want 5h", params.GinkgoTimeout)
+			if params.GinkgoTimeout != "1h30m0s" {
+				t.Errorf("GinkgoTimeout = %q, want 1h30m0s", params.GinkgoTimeout)
 			}
 		})
 	}
@@ -398,6 +398,11 @@ func TestComputeMaintenanceExclusionDuration(t *testing.T) {
 		want          time.Duration
 	}{
 		{
+			name:          "30m soak with 1h30m0s ginkgo timeout gets 3h30m window",
+			ginkgoTimeout: "1h30m0s",
+			want:          3*time.Hour + 30*time.Minute,
+		},
+		{
 			name:          "4h soak with 5h ginkgo timeout gets 7h window",
 			ginkgoTimeout: "5h",
 			want:          7 * time.Hour,
@@ -469,8 +474,8 @@ func TestValidateMemorySoakParameters(t *testing.T) {
 			params: &TestParameters{
 				GinkgoFocus:          "memory-soak",
 				SoakPodCount:         80,
-				SoakDuration:         "4h",
-				SoakScrapeInterval:   "60s",
+				SoakDuration:         "30m",
+				SoakScrapeInterval:   "10s",
 				CSIDriverMemoryLimit: "50Mi",
 			},
 		},

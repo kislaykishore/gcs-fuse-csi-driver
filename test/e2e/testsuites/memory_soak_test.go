@@ -59,8 +59,8 @@ func TestValidateMemorySoakConfig(t *testing.T) {
 	}{
 		{
 			name:           "valid default config",
-			duration:       4 * time.Hour,
-			scrapeInterval: 60 * time.Second,
+			duration:       MemorySoakDuration,
+			scrapeInterval: MemorySoakScrapeInterval,
 			podCount:       80,
 			memLimit:       MemorySoakCSIDriverMemoryLimit,
 			wantLimitBytes: 50 * 1024 * 1024,
@@ -182,6 +182,7 @@ func TestComputeSoakWarmupDuration(t *testing.T) {
 		want time.Duration
 	}{
 		{soak: 4 * time.Hour, want: 2 * time.Minute},
+		{soak: 30 * time.Minute, want: 2 * time.Minute},
 		{soak: 2 * time.Minute, want: 2 * time.Minute},
 		{soak: 90 * time.Second, want: 30 * time.Second},
 		{soak: 60 * time.Second, want: 30 * time.Second},

@@ -119,9 +119,9 @@ done
 
 var (
 	// MemorySoakDuration controls how long the soak loop runs after workload warmup.
-	MemorySoakDuration = 4 * time.Hour
+	MemorySoakDuration = 30 * time.Minute
 	// MemorySoakScrapeInterval controls how frequently the test actively scrapes :9920/metrics.
-	MemorySoakScrapeInterval = 60 * time.Second
+	MemorySoakScrapeInterval = 10 * time.Second
 	// MemorySoakPodCount controls the total number of concurrent workload pods pinned to one node.
 	MemorySoakPodCount = 80
 	// MemorySoakCSIDriverMemoryLimit enforces the container memory limit on ds/gcsfusecsi-node

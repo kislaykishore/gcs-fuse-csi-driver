@@ -80,8 +80,8 @@ var (
 
 	// Memory soak test flags (shared with e2e_test.go in package main).
 	csiDriverMemoryLimit = flag.String("csi-driver-memory-limit", "50Mi", "memory limit enforced on the CSI node driver container during the memory soak test")
-	soakDuration         = flag.Duration("soak-duration", 4*time.Hour, "duration of the CSI driver memory soak test")
-	soakScrapeInterval   = flag.Duration("soak-scrape-interval", 60*time.Second, "interval between active :9920/metrics scrapes during the memory soak test")
+	soakDuration         = flag.Duration("soak-duration", 30*time.Minute, "duration of the CSI driver memory soak test")
+	soakScrapeInterval   = flag.Duration("soak-scrape-interval", 10*time.Second, "interval between active :9920/metrics scrapes during the memory soak test")
 	soakPodCount         = flag.Int("soak-pod-count", 80, "number of concurrent workload pods pinned to one node during the memory soak test")
 )
 

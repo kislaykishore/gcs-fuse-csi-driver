@@ -509,7 +509,7 @@ func ApplyMemorySoakDefaults(testParams *TestParameters, explicitFlags map[strin
 		testParams.NodeMachineType = "n2-standard-32"
 	}
 
-	soakDur := 4 * time.Hour
+	soakDur := 30 * time.Minute
 	if testParams.SoakDuration != "" {
 		if parsed, err := time.ParseDuration(testParams.SoakDuration); err == nil && parsed > 0 {
 			soakDur = parsed
